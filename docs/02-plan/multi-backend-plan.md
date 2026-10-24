@@ -190,9 +190,14 @@ AgentBackend（每个后端实现）:
 ## 10. 附：本机实测命令记录（2026-10-24）
 
 ```text
-zcode --help                        → 0.17.0，确认 -p/--cwd/--resume/--attach/--mode/--locale
-printf initialize | zcode app-server → -32601 Method not found（协议存在但不兼容 Codex）
-listSessions/rpc.discover/ping 探测  → 均 -32601
-codex.exe 实际位置                    → %LOCALAPPDATA%\OpenAI\Codex\bin\a96ca4c1eee0cf35\codex.exe
+zcode --help                        → 0.17.0，重验 -p/--cwd/--resume/--attach/--mode/--locale 全部在
+zcode -p "…" --json --mode yolo     → 结构化输出：{ sessionId, response, usage, projection.status }，
+                                      适配器据此以 --json 为主（偏离 §5.2 的终端文本解析，文本解析留兜底）
+codex.exe 实际位置                    → %LOCALAPPDATA%\OpenAI\Codex\bin\a96ca4c1eee0cf35\codex.exe（重验在）
 ~/.codex/auth.json                   → 存在（登录态在）
+ZcodeBackend 真实两轮                 → 首轮解析 sess_ id，二轮 --resume 后正确回忆首轮信息
+微信真机联调                          → @codex 约 1s 回传，@zcode 冷启动约 28s 回传，并行、前缀均符合预期
 ```
+
+（2026-10-11 初版实测记录已并入上文，原始条目：`printf initialize | zcode app-server → -32601`、
+`listSessions/rpc.discover/ping → -32601`，协议存在但不兼容 Codex，仍为二期前置事实。）

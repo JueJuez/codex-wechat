@@ -9,10 +9,11 @@
 
 ## 当前状态
 
-多后端一期已实现：一个微信号可同时指挥 Codex 与 ZCode 两个本机后端，各后端独立队列并行执行，
+多后端一期已完成并通过真机验证：一个微信号同时指挥 Codex 与 ZCode 两个本机后端，各后端独立队列并行执行，
 `@前缀` 路由、`[平台]` 回传标识、按后端命名的审批编号（`/approve c1`）、逐后端 `/status`。
-Codex 真实命令执行与文件读写、ZCode headless 两轮会话续接（`--resume`）均已在本机验证；
-微信端到端联调（真机扫码发 `@zcode` 任务）待完成后在 [docs/VALIDATION.md](docs/VALIDATION.md) 记录。
+Codex 真实命令执行与文件读写、ZCode headless 两轮会话续接（`--resume`）、微信真机两后端并行联调
+（含停机期间消息补收）均已验证，记录见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+尚未真机验证：附件发到多后端、`/approve c1` 真机操作、`/cancel zcode` 中途取消。
 
 ## Windows 启动
 
