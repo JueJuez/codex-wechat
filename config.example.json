@@ -1,7 +1,21 @@
 {
-  "workspace": "D:/Code/project/wx/codex-wechat",
-  "codexPath": "codex",
-  "permissionMode": "workspace",
-  "model": null,
-  "maxReplyChars": 3000
+  "defaultAgent": "codex",
+  "maxReplyChars": 3000,
+  "agents": {
+    "codex": {
+      "adapter": "codex-app-server",
+      "executable": "codex",
+      "workspace": "D:/Code/project/A",
+      "permissionMode": "workspace",
+      "model": null
+    },
+    "zcode": {
+      "adapter": "zcode-headless",
+      "node": "node",
+      "cli": "D:/AI/ZCode/resources/glm/zcode.cjs",
+      "workspace": "D:/Code/project/B",
+      "mode": "yolo",
+      "locale": "zh-CN"
+    }
+  }
 }

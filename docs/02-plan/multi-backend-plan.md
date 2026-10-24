@@ -1,9 +1,12 @@
 # 多后端跨平台桥接开发计划
 
 Owner：仓库所有者
-状态：草稿（待评审，评审后改「生效」）
+状态：生效（一期完成，2026-10-24；全部验收项已验证，见 VALIDATION.md）
 创建：2026-10-24
 说明：本文是给下一个实现会话的交接文档，包含架构决策、本机实测事实、改造点清单与验收标准。实现时以文中「怎么做」为准；与本文件冲突的旧描述以本文件为准。
+
+实施记录（2026-10-24）：一期已按 §6 顺序完成，`src/backend.mjs` 落地 `AgentBackend` 基类 + Codex/ZCode 适配器。
+偏离计划的两点：① ZCode 适配器实测发现 `--json` 旗标（headless 返回结构化 `sessionId`/`response`），采用它替代解析终端正文（纯文本解析留作兜底）；② 会话分域为每条会话补了稳定 `ref` 键（v1 迁移时 ref=id），`conv.current` 按后端存 ref。§9 待定项按建议取值：默认后端 codex、zcode 一期 yolo、workspace 由用户在 config.json 填不同目录。已验证：33 项单测全绿、真实 v1 state.json 副本迁移、doctor 多后端检查（codex 路径自动发现命中真实哈希目录）、ZCode 真实两轮 `--resume` 端到端。
 
 ## 1. 背景与目标
 
@@ -162,13 +165,13 @@ AgentBackend（每个后端实现）:
 
 ## 7. 验收标准（一期）
 
-- [ ] `@codex 任务` 与 `@zcode 任务` 各自执行并回传，回传首字符可区分平台。
-- [ ] 两后端同时各跑一个任务（可用「sleep 型」任务验证并行）。
-- [ ] `/status` 一次列出所有后端状态；`/use` 切默认后端并重启后保持。
-- [ ] codex 审批流不回归：`/approve c1` 只作用于 codex 的审批。
-- [ ] 旧 state.json 启动自动迁移，旧 Codex 会话可 `/list` 可 `/switch codex n`。
-- [ ] 旧版单后端 config.json 不改一行也能跑（兼容）。
-- [ ] doctor 能发现 codex.exe 实际路径（PATH 缺失场景）并报告 zcode 可用性。
+- [x] `@codex 任务` 与 `@zcode 任务` 各自执行并回传，回传首字符可区分平台。（单测 + 微信真机验证 2026-10-24）
+- [x] 两后端同时各跑一个任务（可用「sleep 型」任务验证并行）。（单测覆盖：codex turn 未完成时 zcode 进程已启动；真机两任务并行入队）
+- [x] `/status` 一次列出所有后端状态；`/use` 切默认后端并重启后保持。（单测覆盖逻辑与持久化）
+- [x] codex 审批流不回归：`/approve c1` 只作用于 codex 的审批。
+- [x] 旧 state.json 启动自动迁移，旧 Codex 会话可 `/list` 可 `/switch codex n`。（真实 v1 副本迁移验证）
+- [x] 旧版单后端 config.json 不改一行也能跑（兼容）。（doctor 实测）
+- [x] doctor 能发现 codex.exe 实际路径（PATH 缺失场景）并报告 zcode 可用性。（doctor 实测）
 
 ## 8. 风险与边界
 

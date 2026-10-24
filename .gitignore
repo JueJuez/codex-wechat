@@ -4,3 +4,4 @@ vendor/wechat-core/lib/
 config.json
 *.log
 outputs/
+.zcode-sandbox/
