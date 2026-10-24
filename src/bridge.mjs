@@ -3,7 +3,7 @@ import { realpath, stat } from 'node:fs/promises';
 import { join, relative, isAbsolute, resolve } from 'node:path';
 import { sessionId8 } from './backend.mjs';
 
-export const HELP = '@引擎 [项目] [/new] 任务 指定引擎与项目执行（如 @zcode brain 调研 X）；带 /new 强制新开会话（如 @zcode wx /new 任务，项目缺省用当前默认）\n/use 引擎 设置本会话默认引擎\n/project 项目 设置本会话默认项目\n/new [项目] [标题] 新会话\n/list 会话列表（按 引擎/项目 分组）\n/switch [引擎[/项目]] 序号 切换会话\n/current 当前引擎、项目与会话\n/status 引擎与项目状态\n/cancel [引擎] 取消任务及排队消息\n/approve 编号 同意一次（编号形如 c1）\n/deny 编号 拒绝\n/answer 编号 问题ID 回答\n/send 路径 回传当前项目工作区文件\n/help 帮助';
+export const HELP = '@引擎 [项目] [/new] 任务 指定引擎与项目执行（如 @zcode brain 调研 X）；带 /new 强制新开会话（如 @zcode wx /new 任务，项目缺省用当前默认）\n/use 引擎 设置本会话默认引擎\n/project 项目 设置本会话默认项目\n/new [项目] [标题] 新会话\n/list 会话列表（按 引擎/项目 分组）\n/switch [引擎[/项目]] 序号 切换会话\n/adopt [引擎[/项目]] 会话id 接管已有会话（如桌面端会话）\n/current 当前引擎、项目与会话\n/status 引擎与项目状态\n/cancel [引擎] 取消任务及排队消息\n/approve 编号 同意一次（编号形如 c1）\n/deny 编号 拒绝\n/answer 编号 问题ID 回答\n/send 路径 回传当前项目工作区文件\n/help 帮助';
 
 export async function confinedFile(workspace, target) {
   const root = await realpath(workspace);
@@ -212,6 +212,36 @@ export class Bridge {
       if (!session) throw new Error('序号无效，请 /list 查看');
       conv.current ??= {}; conv.current[domain.backend.pairKey(domain.project)] = session.ref; await this.store.save();
       return this.reply(message, `已切换（${domain.backend.id}/${domain.project}）：${session.title}`);
+    }
+    if (command === '/adopt') {
+      // /adopt [引擎[/项目]] 会话id：把该域 current 指针绑到已有会话（典型：桌面端会话），
+      // 之后该域消息 --resume/续接该会话。条目标 adopted，/list 可见、/switch 可切回。
+      const parseDomain = tok => {
+        if (!tok) return null;
+        const low = tok.toLowerCase();
+        if (low.includes('/')) {
+          const [a, p] = low.split('/');
+          if (this.backends.has(a) && this.config.projects[p]) return { backend: this.backends.get(a), project: p };
+          return null;
+        }
+        if (this.backends.has(low)) return { backend: this.backends.get(low), project: this.currentProjectId(conv) };
+        if (this.config.projects[low]) return { backend: this.backends.get(this.defaultAgentId(conv)), project: low };
+        return null;
+      };
+      const [first, second, ...extra] = rest;
+      if (!first || extra.length) throw new Error('用法：/adopt [引擎[/项目]] 会话id');
+      const domain = (second !== undefined && parseDomain(first)) || { backend: this.backends.get(this.defaultAgentId(conv)), project: this.currentProjectId(conv) };
+      const sessionId = (second !== undefined && parseDomain(first)) ? second : first;
+      if (this.commandTasks(message.conversationId, domain.backend.id).length) throw new Error(`请先 /cancel ${domain.backend.id} 或等任务完成再接管`);
+      const key = domain.backend.pairKey(domain.project);
+      conv.sessions[key] ??= [];
+      let session = conv.sessions[key].find(s => s.id === sessionId);
+      if (!session) {
+        session = { ref: sessionId, id: sessionId, project: domain.project, title: `adopted:${sessionId8({ id: sessionId })}`, createdAt: new Date().toISOString(), adopted: true };
+        conv.sessions[key].push(session);
+      }
+      conv.current ??= {}; conv.current[key] = session.ref; await this.store.save();
+      return this.reply(message, `已接管（${domain.backend.id}/${domain.project}）：${session.title}。之后消息续接该会话；/list 查看，/switch 序号 可切回。`);
     }
     if (command === '/cancel') {
       const target = (rest[0] || '').toLowerCase();

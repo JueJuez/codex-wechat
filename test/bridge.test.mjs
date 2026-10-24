@@ -161,6 +161,23 @@ test('@引擎 内联 /new 强制新开会话；无任务时降级为 /new 命令
   assert.ok(output.filter(s => s.includes('"-p"')).some(s => s.includes('"-p","写个 /new 命令的测试"')));
 });
 
+test('/adopt 绑定已有会话（桌面会话接管），后续消息 --resume 该会话', async () => {
+  const { bridge, output, store } = await fixture();
+  await bridge.accept(message('/adopt zcode/wx session_desktop1234', 'a1'));
+  await until(() => output.some(s => s.includes('已接管（zcode/wx）')));
+  const conv = () => store.data.conversations['bot:owner'];
+  assert.equal(conv().current['zcode/wx'], 'session_desktop1234');
+  assert.equal(conv().sessions['zcode/wx'][0].adopted, true);
+  await bridge.accept(message('@zcode 接着桌面任务干', 'a2'));
+  await until(() => output.filter(s => s.includes('zcode fake done')).length >= 1);
+  const argsText = output.find(s => s.includes('"--cwd"'));
+  assert.ok(argsText.includes('"--resume","session_desktop1234"'), `应 resume 被接管的会话：${argsText}`);
+  // 重复 /adopt 幂等：不新增条目
+  await bridge.accept(message('/adopt zcode/wx session_desktop1234', 'a3'));
+  await until(() => output.filter(s => s.includes('已接管（zcode/wx）')).length >= 2);
+  assert.equal(conv().sessions['zcode/wx'].length, 1);
+});
+
 test('/project switches the conversation default project for bare messages', async () => {
   const { bridge, codex, output, store, wsBrain } = await fixture({ withZcode: false });
   await bridge.accept(message('/project brain', 'p3'));

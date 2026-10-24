@@ -93,6 +93,7 @@ npm start
 | `/use zcode` | 设置本会话默认引擎（重启后保持） |
 | `/project brain` | 设置本会话默认项目（重启后保持） |
 | `/new [项目] 标题` | 创建新会话（默认引擎） |
+| `/adopt [引擎[/项目]] 会话id` | 接管已有会话（如桌面端会话），之后消息续接它 |
 | `/list` | 会话列表（按 引擎/项目 分组） |
 | `/switch [引擎[/项目]] 2` | 按列表序号切换，可带域 |
 | `/current` | 当前引擎、项目与各域当前会话 |
@@ -109,6 +110,19 @@ npm start
 切换或新建前需完成或取消该后端的当前及排队任务。
 
 ZCode 后端一期边界：每条消息一次进程冷启动（秒级），无流式回传；`yolo` 模式无审批转发。
+
+### 桌面会话接管（微信操作桌面 Agent）
+
+桌面端布置任务并让它完成后微信通知，回复的上下文就能续接桌面会话：
+
+1. 桌面任务里（或手动）执行 `node scripts/notify.mjs "任务完成：XX"`——脚本自动识别当前目录最近活跃的桌面会话 id，
+   从 config 反查项目名，发微信通知并附上现成的 `/adopt` 命令；`--dry` 只打印不发送。
+2. 微信回复那条 `/adopt` 命令（如 `/adopt zcode/wx session_xxx`），桥把该 引擎×项目 域的 current 指针绑到桌面会话。
+3. 之后该域消息直接 `--resume` 续接桌面会话；`/list` 里显示为 `adopted:`，`/switch 序号` 可切回桥自己的会话。
+
+前置条件（2026-10-25 探针实测）：桌面与 headless 会话同库（`~/.zcode/cli/db/db.sqlite`），`--resume` 可解析桌面会话 id；
+但桌面会话若使用 `account:` 套餐 provider 的模型，headless 无法解析而报 "Select a model"——
+桌面端需把模型切到与 headless 共享的 provider（如 `new-provider` 下的模型）后再开的会话才可被接管。
 
 ## 权限与状态
 
