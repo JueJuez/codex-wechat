@@ -3,7 +3,7 @@ import { realpath, stat } from 'node:fs/promises';
 import { join, relative, isAbsolute, resolve } from 'node:path';
 import { sessionId8 } from './backend.mjs';
 
-export const HELP = '@后端 任务 指定后端执行（如 @codex / @zcode）\n/use 后端 设置本会话默认后端\n/new 标题 新会话（默认后端）\n/list 会话列表（按后端分组）\n/switch [后端] 序号 切换会话\n/current 当前会话\n/status 各后端状态\n/cancel [后端] 取消任务及排队消息\n/approve 编号 同意一次（编号形如 c1）\n/deny 编号 拒绝\n/answer 编号 问题ID 回答\n/send 路径 回传默认后端工作区文件\n/help 帮助';
+export const HELP = '@引擎 [项目] 任务 指定引擎与项目执行（如 @zcode brain 调研 X）\n/use 引擎 设置本会话默认引擎\n/project 项目 设置本会话默认项目\n/new [项目] [标题] 新会话\n/list 会话列表（按 引擎/项目 分组）\n/switch [引擎[/项目]] 序号 切换会话\n/current 当前引擎、项目与会话\n/status 引擎与项目状态\n/cancel [引擎] 取消任务及排队消息\n/approve 编号 同意一次（编号形如 c1）\n/deny 编号 拒绝\n/answer 编号 问题ID 回答\n/send 路径 回传当前项目工作区文件\n/help 帮助';
 
 export async function confinedFile(workspace, target) {
   const root = await realpath(workspace);
@@ -16,20 +16,37 @@ export async function confinedFile(workspace, target) {
 }
 
 export class Bridge {
-  // backends: Map<id, AgentBackend>，由 cli 装配；Bridge 只做路由、命令与会话簿记。
+  // backends: Map<引擎id, AgentBackend>，由 cli 装配；项目目录在 config.projects。
+  // Bridge 只做路由、命令与会话簿记；项目互斥锁保证同项目跨引擎串行。
   constructor({ backends, store, config, sendText, sendFile, downloadMedia, log = console.error }) {
     Object.assign(this, { backends, store, config, sendText, sendFile, downloadMedia, log });
     this.outgoing = Promise.resolve();
+    this.projectLocks = new Map();
     for (const backend of backends.values()) {
       backend.attach({ store, config, reply: (m, t) => this.reply(m, t, backend.label), downloadMedia, log });
+      backend.acquireProject = job => this.lockProject(job.project);
     }
   }
   conversation(message) {
-    return this.store.data.conversations[message.conversationId] ??= { peerId: message.peerId, sessions: {}, current: {}, defaultAgent: null };
+    return this.store.data.conversations[message.conversationId] ??= { peerId: message.peerId, sessions: {}, current: {}, defaultAgent: null, currentProject: null };
   }
   defaultAgentId(conv) {
     if (conv.defaultAgent && this.backends.has(conv.defaultAgent)) return conv.defaultAgent;
     return this.config.defaultAgent;
+  }
+  currentProjectId(conv) {
+    if (conv.currentProject && this.config.projects[conv.currentProject]) return conv.currentProject;
+    return this.config.defaultProject;
+  }
+  // 同一项目任何时刻只放行一个任务（跨引擎也串行）；不同项目互不阻塞。
+  // 单任务单锁、无嵌套持锁，无循环等待面。返回在锁到手时才 resolve 的 release。
+  lockProject(projectId) {
+    const prev = this.projectLocks.get(projectId) ?? Promise.resolve();
+    let release;
+    const gate = new Promise(r => { release = r; });
+    const acquired = prev.then(() => release);
+    this.projectLocks.set(projectId, prev.then(() => gate));
+    return acquired;
   }
   reply(message, text, label = null) {
     const body = label ? `[${label}] ${text || '任务完成，未返回文字。'}` : (text || '任务完成，未返回文字。');
@@ -54,6 +71,7 @@ export class Bridge {
     if (message.contextToken) conv.contextToken = message.contextToken;
     if (this.store.data.jobs.length >= 100) throw new Error('待处理消息已达 100 条，请先取消或等待');
     let agentId = null;
+    let projectId = null;
     if (!message.text.startsWith('/')) {
       const at = /^@([A-Za-z][A-Za-z0-9-]*)(?:\s+([\s\S]+))?$/.exec(message.text.trim());
       if (at) {
@@ -62,14 +80,25 @@ export class Bridge {
           this.recordSeen(key);
           try { await this.store.save(); }
           catch (e) { if (key) this.store.data.seen = this.store.data.seen.filter(k => k !== key); throw e; }
-          if (!backend) return this.reply(message, `未知后端 @${at[1]}。可用：${[...this.backends.keys()].map(k => '@' + k).join('、')}；/use 后端 设置默认。`);
-          return this.reply(message, `请在 @${backend.id} 后写任务内容，例如：@${backend.id} 列出当前目录`);
+          if (!backend) return this.reply(message, `未知引擎 @${at[1]}。可用：${[...this.backends.keys()].map(k => '@' + k).join('、')}；/use 引擎 设置默认。`);
+          return this.reply(message, `请在 @${backend.id} 后写任务内容，也可带项目：@${backend.id} ${this.config.defaultProject} 列出当前目录`);
         }
-        message = { ...message, text: at[2].trim() };
+        // 第二段命中已注册项目 id 则消费为项目，否则整句为任务、用当前项目。
+        let rest = at[2].trim();
+        const lead = /^([a-z][a-z0-9-]*)(?:\s+([\s\S]+))?$/.exec(rest);
+        if (lead && this.config.projects[lead[1]]) {
+          if (!lead[2]) return this.reply(message, `已指定项目 ${lead[1]} 但任务内容为空，例如：@${backend.id} ${lead[1]} 列出当前目录`);
+          projectId = lead[1];
+          rest = lead[2].trim();
+        } else projectId = this.currentProjectId(conv);
+        message = { ...message, text: rest };
         agentId = backend.id;
-      } else agentId = this.defaultAgentId(conv);
+      } else {
+        agentId = this.defaultAgentId(conv);
+        projectId = this.currentProjectId(conv);
+      }
     }
-    const job = { id: randomUUID(), message, status: 'pending', ...(agentId ? { agent: agentId } : {}) };
+    const job = { id: randomUUID(), message, status: 'pending', agent: agentId, project: projectId };
     this.store.data.jobs.push(job);
     this.recordSeen(key);
     try { await this.store.save(); }
@@ -83,7 +112,10 @@ export class Bridge {
         await this.reply(job.message, '桥接程序上次中断，任务结果未知，未自动重跑。可继续询问当前状态。');
         this.remove(job);
       } else if (job.message.text.startsWith('/')) await this.executeCommand(job);
-      else if (!this.backends.has(job.agent)) job.agent = this.config.defaultAgent;
+      else {
+        if (!this.backends.has(job.agent)) job.agent = this.config.defaultAgent;
+        if (!this.config.projects[job.project]) job.project = this.config.defaultProject;
+      }
     }
     await this.store.save();
     for (const backend of this.backends.values()) backend.pump();
@@ -108,33 +140,56 @@ export class Bridge {
       const backend = this.backends.get((rest[0] || '').toLowerCase());
       if (!backend) throw new Error(`用法：/use ${[...this.backends.keys()].join('|')}`);
       conv.defaultAgent = backend.id; await this.store.save();
-      return this.reply(message, `本会话默认后端已设为 ${backend.id}。`);
+      return this.reply(message, `本会话默认引擎已设为 ${backend.id}。`);
+    }
+    if (command === '/project') {
+      const id = (rest[0] || '').toLowerCase();
+      if (!this.config.projects[id]) throw new Error(`未知项目 ${id}。可用：${Object.keys(this.config.projects).join('、')}`);
+      conv.currentProject = id; await this.store.save();
+      return this.reply(message, `本会话默认项目已设为 ${id}（${this.config.projects[id].workspace}）。`);
     }
     if (command === '/new') {
       const backend = this.backends.get(this.defaultAgentId(conv));
+      // /new [项目] [标题]：第一段命中项目 id 则作为目标项目，否则整段为标题。
+      let project = this.currentProjectId(conv);
+      let title = arg;
+      if (arg && this.config.projects[arg.toLowerCase()]) { project = arg.toLowerCase(); title = rest.slice(1).join(' '); }
       if (this.commandTasks(message.conversationId, backend.id).length) throw new Error(`请先 /cancel ${backend.id} 或等任务完成再新建`);
-      const session = await backend.ensureSession(conv, arg || '微信会话');
+      const session = await backend.ensureSession(conv, project, title || '微信会话');
       await this.store.save();
-      return this.reply(message, `已新建（${backend.id}）：${session.title}（${sessionId8(session)}）`);
+      return this.reply(message, `已新建（${backend.id}/${project}）：${session.title}（${sessionId8(session)}）`);
     }
     if (command === '/list') return this.reply(message, this.listText(conv));
     if (command === '/current') return this.reply(message, this.currentText(conv));
     if (command === '/switch') {
       const [first, second, ...extra] = rest;
-      let backend; let key;
-      if (second !== undefined && this.backends.has((first || '').toLowerCase())) { backend = this.backends.get(first.toLowerCase()); key = second; }
-      else { backend = this.backends.get(this.defaultAgentId(conv)); key = first; }
-      if (extra.length || !key) throw new Error('用法：/switch [后端] 序号');
-      if (this.commandTasks(message.conversationId, backend.id).length) throw new Error(`请先 /cancel ${backend.id} 或等任务完成再切换`);
-      const sessions = conv.sessions[backend.id] || [];
+      // /switch [引擎[/项目]] 序号：省略域时用当前引擎×当前项目；裸项目名用默认引擎。
+      const parseDomain = tok => {
+        if (!tok) return null;
+        const low = tok.toLowerCase();
+        if (low.includes('/')) {
+          const [a, p] = low.split('/');
+          if (this.backends.has(a) && this.config.projects[p]) return { backend: this.backends.get(a), project: p };
+          return null;
+        }
+        if (this.backends.has(low)) return { backend: this.backends.get(low), project: this.currentProjectId(conv) };
+        if (this.config.projects[low]) return { backend: this.backends.get(this.defaultAgentId(conv)), project: low };
+        return null;
+      };
+      if (second !== undefined && !parseDomain(first)) throw new Error(`域无效：${first}（形如 引擎、项目 或 引擎/项目）`);
+      const domain = (second !== undefined && parseDomain(first)) || { backend: this.backends.get(this.defaultAgentId(conv)), project: this.currentProjectId(conv) };
+      const key = second !== undefined ? second : first;
+      if (extra.length || !key) throw new Error('用法：/switch [引擎[/项目]] 序号');
+      if (this.commandTasks(message.conversationId, domain.backend.id).length) throw new Error(`请先 /cancel ${domain.backend.id} 或等任务完成再切换`);
+      const sessions = conv.sessions[domain.backend.pairKey(domain.project)] || [];
       const session = /^\d+$/.test(key) ? sessions[Number(key) - 1] : sessions.find(s => s.id === key || sessionId8(s) === key);
       if (!session) throw new Error('序号无效，请 /list 查看');
-      conv.current[backend.id] = session.ref; await this.store.save();
-      return this.reply(message, `已切换（${backend.id}）：${session.title}`);
+      conv.current ??= {}; conv.current[domain.backend.pairKey(domain.project)] = session.ref; await this.store.save();
+      return this.reply(message, `已切换（${domain.backend.id}/${domain.project}）：${session.title}`);
     }
     if (command === '/cancel') {
       const target = (rest[0] || '').toLowerCase();
-      if (target && !this.backends.has(target)) throw new Error(`未知后端 ${target}；/cancel 不带参数作用于全部后端`);
+      if (target && !this.backends.has(target)) throw new Error(`未知引擎 ${target}；/cancel 不带参数作用于全部引擎`);
       const targets = target ? [this.backends.get(target)] : [...this.backends.values()];
       for (const job of this.store.data.jobs) if (!job.message.text.startsWith('/') && job.message.conversationId === message.conversationId && (!target || job.agent === target)) job.cancelled = true;
       this.store.data.jobs = this.store.data.jobs.filter(j => j.message.conversationId !== message.conversationId || (target && j.agent !== target) || j.status === 'running');
@@ -165,40 +220,49 @@ export class Bridge {
     }
     if (command === '/send') {
       if (!arg) throw new Error('请输入文件路径');
-      const backend = this.backends.get(this.defaultAgentId(conv));
-      const file = await confinedFile(backend.workspace, arg);
+      const workspace = this.config.projects[this.currentProjectId(conv)].workspace;
+      const file = await confinedFile(workspace, arg);
       await this.sendFile(message, file); return;
     }
     throw new Error('未知命令，使用 /help 查看');
   }
   statusText() {
-    const lines = [`全局排队 ${this.store.data.jobs.filter(j => j.status === 'pending' && !j.message.text.startsWith('/')).length} 条`];
+    const jobs = this.store.data.jobs.filter(j => !j.message.text.startsWith('/'));
+    const lines = [`全局排队 ${jobs.filter(j => j.status === 'pending').length} 条`];
     for (const [id, backend] of this.backends) {
-      const queued = this.store.data.jobs.filter(j => j.status === 'pending' && j.agent === id && !j.message.text.startsWith('/')).length;
-      const parts = [`${id} ${backend.connected ? '已连接' : '已断开'}`, `运行 ${backend.working ? 1 : 0}`, `排队 ${queued}`, `审批 ${backend.approvalsPending()}`, `工作区 ${backend.workspace}`];
+      const queued = jobs.filter(j => j.status === 'pending' && j.agent === id).length;
+      const parts = [`${id} ${backend.connected ? '已连接' : '已断开'}`, `运行 ${backend.working ? 1 : 0}`, `排队 ${queued}`, `审批 ${backend.approvalsPending()}`];
       const note = backend.statusNote();
       if (note) parts.push(note);
       lines.push(parts.join('；'));
+    }
+    for (const [id, project] of Object.entries(this.config.projects)) {
+      const mine = jobs.filter(j => j.project === id);
+      const running = mine.filter(j => j.status === 'running').length;
+      const pending = mine.filter(j => j.status === 'pending').length;
+      lines.push(`[项目 ${id}] ${running ? `运行 ${running}` : '空闲'}${pending ? `；排队 ${pending}` : ''}；${project.workspace}`);
     }
     if (this.config.sharedWorkspaceWarning) lines.push(`⚠ ${this.config.sharedWorkspaceWarning}`);
     return lines.join('\n');
   }
   listText(conv) {
+    const keys = Object.keys(conv.sessions || {}).sort();
+    if (!keys.length) return '暂无会话';
     const lines = [];
-    for (const [id] of this.backends) {
-      const sessions = conv.sessions[id] || [];
-      lines.push(`[${id}]${sessions.length ? '' : ' 暂无会话'}`);
-      sessions.forEach((s, i) => lines.push(`${i + 1}. ${s.ref === conv.current?.[id] ? '→ ' : ''}${s.title} [${sessionId8(s)}]`));
+    for (const key of keys) {
+      const sessions = conv.sessions[key];
+      lines.push(`[${key}]${sessions.length ? '' : ' 暂无会话'}`);
+      sessions.forEach((s, i) => lines.push(`${i + 1}. ${s.ref === conv.current?.[key] ? '→ ' : ''}${s.title} [${sessionId8(s)}]`));
     }
     return lines.join('\n');
   }
   currentText(conv) {
-    const lines = [];
-    for (const [id, backend] of this.backends) {
-      const session = (conv.sessions[id] || []).find(s => s.ref === conv.current?.[id]);
-      lines.push(`[${id}] ${session ? `${session.title}（${sessionId8(session)}）` : '无'}`);
+    const project = this.currentProjectId(conv);
+    const lines = [`引擎：${this.defaultAgentId(conv)}；项目：${project}（${this.config.projects[project].workspace}）`];
+    for (const key of Object.keys(conv.sessions || {}).sort()) {
+      const session = (conv.sessions[key] || []).find(s => s.ref === conv.current?.[key]);
+      lines.push(`[${key}] ${session ? `${session.title}（${sessionId8(session)}）` : '无'}`);
     }
-    lines.push(`默认后端：${this.defaultAgentId(conv)}`);
     return lines.join('\n');
   }
 }

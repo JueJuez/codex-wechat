@@ -31,15 +31,18 @@ export async function resolveCodexExecutable(explicit) {
   return explicit || 'codex';
 }
 
-// 每后端一个实例：串行队列（后端内一次一个任务），后端之间并行。
+// 每引擎一个实例：串行队列（引擎内一次一个任务），引擎之间并行。
+// workspace 不在实例上：同一引擎可跨项目干活，目录由任务的 project 决定（见 execute/ensureSession）。
 // 子类必须实现 ensureSession / sendTurn；可选覆盖 init/close/connected/statusNote/cancelConversation。
 export class AgentBackend {
-  constructor({ id, workspace }) {
-    if (!/^[a-z][a-z0-9-]*$/.test(id)) throw new Error(`后端 id 无效（小写字母开头，可含数字/-）：${id}`);
-    this.id = id; this.label = id; this.workspace = workspace;
+  constructor({ id }) {
+    if (!/^[a-z][a-z0-9-]*$/.test(id)) throw new Error(`引擎 id 无效（小写字母开头，可含数字/-）：${id}`);
+    this.id = id; this.label = id;
     this.approvals = new Map(); this.counter = 0;
     this.working = false; this.workerPromise = Promise.resolve(); this.currentMessage = null;
     this.onDisconnect = null;
+    // 由 Bridge 注入：job → 项目互斥锁的释放函数（同项目跨引擎串行）。
+    this.acquireProject = null;
   }
   attach({ store, config, reply, downloadMedia, log }) { Object.assign(this, { store, config, reply, downloadMedia, log }); }
   get connected() { return true; }
@@ -47,20 +50,22 @@ export class AgentBackend {
   close() {}
   statusNote() { return ''; }
   approvalsPending() { return this.approvals.size; }
-  domain(conv) { conv.sessions[this.id] ??= []; return conv.sessions[this.id]; }
-  currentRef(conv) { return conv.current?.[this.id] || null; }
-  sessionByRef(conv, ref) { return ref ? this.domain(conv).find(s => s.ref === ref) : null; }
-  async ensureSession(conv, title = '微信会话') { throw new Error(`${this.id} 未实现 ensureSession`); }
+  // 会话按「引擎/项目」复合键分域；旧版键为纯引擎 id，由 storage 迁移补齐。
+  pairKey(project) { return `${this.id}/${project}`; }
+  domain(conv, project) { const key = this.pairKey(project); return conv.sessions[key] ??= []; }
+  currentRef(conv, project) { return conv.current?.[this.pairKey(project)] || null; }
+  sessionByRef(conv, project, ref) { return ref ? this.domain(conv, project).find(s => s.ref === ref) : null; }
+  async ensureSession(conv, project, title = '微信会话') { throw new Error(`${this.id} 未实现 ensureSession`); }
   // 返回 { status: 'completed'|'failed'|'interrupted', output?, error? }
   async sendTurn(text, files, session, message) { throw new Error(`${this.id} 未实现 sendTurn`); }
   async interrupt() {}
   async cancelConversation() {}
-  async prepareFiles(message) {
+  async prepareFiles(message, workspace) {
     const files = [];
     for (const item of message.media ?? []) {
       const media = await this.downloadMedia(item);
       if (!media) throw new Error('附件缺少下载信息');
-      const dir = join(this.workspace, '.codex-wechat', 'inbox', randomUUID());
+      const dir = join(workspace, '.codex-wechat', 'inbox', randomUUID());
       await mkdir(dir, { recursive: true });
       const safeName = basename(media.fileName.replaceAll('\\', '/')).replace(/[<>:"|?*\x00-\x1f]/g, '_') || 'attachment.bin';
       const file = join(dir, safeName); await writeFile(file, media.data);
@@ -89,19 +94,24 @@ export class AgentBackend {
     }
   }
   async execute(message, job) {
-    const conv = this.store.data.conversations[message.conversationId];
-    const files = await this.prepareFiles(message);
-    if (job.cancelled) return this.reply(message, '任务已在准备阶段取消。');
-    let session = this.sessionByRef(conv, this.currentRef(conv));
-    if (!session) { session = await this.ensureSession(conv, message.text.slice(0, 32) || '微信附件'); await this.store.save(); }
-    await this.reply(message, `已收到，${this.label} 开始处理。`);
-    if (job.cancelled) return this.reply(message, '任务已取消。');
-    this.currentMessage = message;
-    let result;
-    try { result = await this.sendTurn(message.text || '请处理这些附件', files, session, message); }
-    finally { this.currentMessage = null; await this.store.save(); }
-    if (result.status === 'completed') await this.reply(message, result.output || '任务完成，未返回文字。');
-    else await this.reply(message, `${result.status === 'interrupted' ? '任务已停止' : '任务失败'}${result.error ? '：' + result.error : ''}${result.output ? '\n' + result.output : ''}`);
+    const release = this.acquireProject ? await this.acquireProject(job) : null;
+    try {
+      const conv = this.store.data.conversations[message.conversationId];
+      const project = this.config.projects[job.project];
+      if (!project) throw new Error(`任务指向未知项目 ${job.project}（配置已变？请 /cancel 后重发）`);
+      const files = await this.prepareFiles(message, project.workspace);
+      if (job.cancelled) return this.reply(message, '任务已在准备阶段取消。');
+      let session = this.sessionByRef(conv, job.project, this.currentRef(conv, job.project));
+      if (!session) { session = await this.ensureSession(conv, job.project, message.text.slice(0, 32) || '微信附件'); await this.store.save(); }
+      await this.reply(message, `已收到，${this.label} → ${job.project} 开始处理。`);
+      if (job.cancelled) return this.reply(message, '任务已取消。');
+      this.currentMessage = message;
+      let result;
+      try { result = await this.sendTurn(message.text || '请处理这些附件', files, session, message); }
+      finally { this.currentMessage = null; await this.store.save(); }
+      if (result.status === 'completed') await this.reply(message, result.output || '任务完成，未返回文字。');
+      else await this.reply(message, `${result.status === 'interrupted' ? '任务已停止' : '任务失败'}${result.error ? '：' + result.error : ''}${result.output ? '\n' + result.output : ''}`);
+    } finally { if (release) await release(); }
   }
 }
 
@@ -127,21 +137,23 @@ export class CodexBackend extends AgentBackend {
       ? { approvalPolicy: 'never', sandbox: 'danger-full-access' }
       : { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
   }
-  async ensureSession(conv, title = '微信会话') {
+  async ensureSession(conv, project, title = '微信会话') {
+    const workspace = this.config.projects[project].workspace;
     const result = await this.client.call('thread/start', {
-      cwd: this.workspace, ...this.turnParams(),
+      cwd: workspace, ...this.turnParams(),
       ...(this.model ? { model: this.model } : {}),
       developerInstructions: CODEX_DEV_INSTRUCTIONS
     });
-    const session = { ref: result.thread.id, id: result.thread.id, title, createdAt: new Date().toISOString() };
-    this.domain(conv).push(session); conv.current ??= {}; conv.current[this.id] = session.ref;
+    const session = { ref: result.thread.id, id: result.thread.id, project, title, createdAt: new Date().toISOString() };
+    this.domain(conv, project).push(session); conv.current ??= {}; conv.current[this.pairKey(project)] = session.ref;
     this.resumed.add(session.id);
     return session;
   }
   async sendTurn(text, files, session, message) {
     const threadId = session.id;
+    const workspace = this.config.projects[session.project].workspace;
     if (!this.resumed.has(threadId)) {
-      await this.client.call('thread/resume', { threadId, cwd: this.workspace, ...this.turnParams() });
+      await this.client.call('thread/resume', { threadId, cwd: workspace, ...this.turnParams() });
       this.resumed.add(threadId);
     }
     const input = [{ type: 'text', text: text + (files.length ? '\n附件已保存到本机：\n' + files.map(f => f.path).join('\n') : '') }];
@@ -221,24 +233,25 @@ function lastLines(text, count = 8) {
 // 一期：每条消息一次 headless 进程（node zcode.cjs -p …），--json 拿结构化结果。
 // yolo 模式没有中途审批通道，等于预授权放行；务必给独立 workspace。
 export class ZcodeBackend extends AgentBackend {
-  constructor({ id = 'zcode', workspace, node = 'node', cli, mode = 'yolo', locale = 'zh-CN' }) {
-    super({ id, workspace });
+  constructor({ id = 'zcode', node = 'node', cli, mode = 'yolo', locale = 'zh-CN' }) {
+    super({ id });
     this.node = node; this.cli = cli; this.mode = mode; this.locale = locale;
     this.current = null; this.interruptRequested = false;
   }
   statusNote() { return `模式 ${this.mode}（无审批转发）`; }
-  async ensureSession(conv, title = '微信会话') {
-    const session = { ref: randomUUID(), id: null, title, createdAt: new Date().toISOString() };
-    this.domain(conv).push(session); conv.current ??= {}; conv.current[this.id] = session.ref;
+  async ensureSession(conv, project, title = '微信会话') {
+    const session = { ref: randomUUID(), id: null, project, title, createdAt: new Date().toISOString() };
+    this.domain(conv, project).push(session); conv.current ??= {}; conv.current[this.pairKey(project)] = session.ref;
     return session;
   }
   async sendTurn(text, files, session) {
-    const args = [this.cli, '-p', text, '--cwd', this.workspace, '--mode', this.mode, '--json'];
+    const workspace = this.config.projects[session.project].workspace;
+    const args = [this.cli, '-p', text, '--cwd', workspace, '--mode', this.mode, '--json'];
     if (this.locale) args.push('--locale', this.locale);
     if (session.id) args.push('--resume', session.id);
     for (const file of files) args.push('--attach', file.path);
     this.interruptRequested = false;
-    const child = spawn(this.node, args, { cwd: this.workspace, windowsHide: true });
+    const child = spawn(this.node, args, { cwd: workspace, windowsHide: true });
     this.current = child;
     let stdout = ''; let stderr = '';
     child.stdout.on('data', d => { stdout += d; });

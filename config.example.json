@@ -1,11 +1,11 @@
 {
   "defaultAgent": "codex",
+  "defaultProject": "project-a",
   "maxReplyChars": 3000,
   "agents": {
     "codex": {
       "adapter": "codex-app-server",
       "executable": "codex",
-      "workspace": "D:/Code/project/A",
       "permissionMode": "workspace",
       "model": null
     },
@@ -13,9 +13,16 @@
       "adapter": "zcode-headless",
       "node": "node",
       "cli": "D:/AI/ZCode/resources/glm/zcode.cjs",
-      "workspace": "D:/Code/project/B",
       "mode": "yolo",
       "locale": "zh-CN"
+    }
+  },
+  "projects": {
+    "project-a": {
+      "workspace": "D:/Code/project/A"
+    },
+    "project-b": {
+      "workspace": "D:/Code/project/B"
     }
   }
 }

@@ -19,10 +19,16 @@ console.log('sess_fake-' + (args.includes('--resume') ? 'resumed' : 'fresh'));
 console.log('args ' + JSON.stringify(args));
 console.log('zcode fake done');`;
 const SLOW_ZCODE = `setTimeout(() => { console.log('slow done'); }, 8000);`;
+// 挂起直到工作目录下出现 gate 文件；用于精确控制任务时序。
+const GATED_ZCODE = `const fs = require('fs');
+console.log('sess_fake-' + (process.argv.includes('--resume') ? 'resumed' : 'fresh'));
+for (;;) { try { fs.accessSync('gate'); break; } catch {} Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50); }
+console.log('zcode gated done');`;
 
 async function fixture({ zcodeScript = FAKE_ZCODE, withZcode = true } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'codex-wechat-test-'));
-  const wsCodex = join(dir, 'ws-codex'); await mkdir(wsCodex);
+  const wsWx = join(dir, 'ws-wx'); await mkdir(wsWx);
+  const wsBrain = join(dir, 'ws-brain'); await mkdir(wsBrain);
   const store = await new Storage(join(dir, 'state.json')).load(); store.data.account = { userId: 'owner' };
   const codex = new EventEmitter(); codex.calls = []; codex.responses = []; let seq = 0;
   codex.call = async (method, params) => {
@@ -34,16 +40,16 @@ async function fixture({ zcodeScript = FAKE_ZCODE, withZcode = true } = {}) {
   codex.respond = (id, result) => codex.responses.push({ id, result });
   codex.rejectRequest = id => codex.responses.push({ id, rejected: true });
   const backends = new Map();
-  backends.set('codex', new CodexBackend({ id: 'codex', workspace: wsCodex, permissionMode: 'workspace', client: codex }));
+  backends.set('codex', new CodexBackend({ id: 'codex', permissionMode: 'workspace', client: codex }));
   if (withZcode) {
-    const wsZcode = join(dir, 'ws-zcode'); await mkdir(wsZcode);
     const cli = join(dir, 'fake-zcode.cjs');
     await writeFile(cli, zcodeScript);
-    backends.set('zcode', new ZcodeBackend({ id: 'zcode', workspace: wsZcode, node: process.execPath, cli }));
+    backends.set('zcode', new ZcodeBackend({ id: 'zcode', node: process.execPath, cli }));
   }
   const output = [];
-  const bridge = new Bridge({ backends, store, config: { defaultAgent: 'codex', maxReplyChars: 3000 }, sendText: async (m, text) => output.push(text), sendFile: async () => {}, downloadMedia: async () => {}, log: () => {} });
-  return { dir, bridge, store, codex, output, backends, wsCodex };
+  const projects = { wx: { workspace: wsWx }, brain: { workspace: wsBrain } };
+  const bridge = new Bridge({ backends, store, config: { defaultAgent: 'codex', defaultProject: 'wx', maxReplyChars: 3000, projects }, sendText: async (m, text) => output.push(text), sendFile: async () => {}, downloadMedia: async () => {}, log: () => {} });
+  return { dir, bridge, store, codex, output, backends, projects, wsWx, wsBrain };
 }
 function complete(codex, threadId = 'thread-1', status = 'completed') {
   codex.emit('notification', { method: 'item/completed', params: { threadId, item: { id: 'answer', type: 'agentMessage', text: '真实结果' } } });
@@ -69,14 +75,14 @@ test('task without prefix goes to default backend and reply carries platform pre
   const job = store.data.jobs.find(j => j.agent === 'codex');
   assert.equal(store.data.jobs[0].agent, 'codex');
   complete(codex); await until(() => !bridge.backends.get('codex').working);
-  assert.ok(output.some(s => s.startsWith('[codex] 已收到，codex 开始处理')));
+  assert.ok(output.some(s => s.startsWith('[codex] 已收到，codex → wx 开始处理')));
   assert.ok(output.some(s => s.startsWith('[codex] 真实结果')));
 });
 
 test('unknown @backend answers with available list and enqueues nothing', async () => {
   const { bridge, codex, output, store } = await fixture();
   await bridge.accept(message('@nope 任务', 'm1'));
-  await until(() => output.some(s => s.includes('未知后端 @nope')));
+  await until(() => output.some(s => s.includes('未知引擎 @nope')));
   assert.ok(output.some(s => s.includes('@codex') && s.includes('@zcode')));
   assert.equal(store.data.jobs.length, 0);
   assert.equal(codex.calls.length, 0);
@@ -91,9 +97,9 @@ test('@zcode routes to zcode backend; session id parsed then passed via --resume
   await until(() => output.filter(s => s.includes('zcode fake done')).length >= 1);
   assert.ok(output.some(s => s.startsWith('[zcode] ')));
   const conv = store.data.conversations['bot:owner'];
-  const session = conv.sessions.zcode[0];
+  const session = conv.sessions['zcode/wx'][0];
   assert.equal(session.id, 'sess_fake-fresh');
-  assert.equal(conv.current.zcode, session.ref);
+  assert.equal(conv.current['zcode/wx'], session.ref);
   assert.equal(codex.calls.length, 0);
   await bridge.accept(message('@zcode 再来一次', 'z2'));
   await until(() => output.filter(s => s.includes('zcode fake done')).length >= 2);
@@ -102,10 +108,65 @@ test('@zcode routes to zcode backend; session id parsed then passed via --resume
   assert.ok(argsText.includes('"--mode","yolo"'));
 });
 
+test('@engine with project token routes to that project workspace', async () => {
+  const { bridge, output, store, wsBrain } = await fixture();
+  await bridge.accept(message('@zcode brain 查看目录', 'p1'));
+  await until(() => output.filter(s => s.includes('zcode fake done')).length >= 1);
+  const argsText = output.find(s => s.includes('--cwd'));
+  assert.ok(argsText.includes('ws-brain'), `应指向 brain 工作区：${argsText}`);
+  const conv = store.data.conversations['bot:owner'];
+  assert.equal(conv.sessions['zcode/brain'][0].id, 'sess_fake-fresh');
+});
+
+test('second token that is not a project id stays part of the task', async () => {
+  const { bridge, output, store } = await fixture();
+  await bridge.accept(message('@zcode 写个 hello world', 'p2'));
+  await until(() => output.filter(s => s.includes('zcode fake done')).length >= 1);
+  const argsText = output.find(s => s.includes('"-p"'));
+  assert.ok(argsText.includes('"-p","写个 hello world"'), `任务文本应完整：${argsText}`);
+  const conv = store.data.conversations['bot:owner'];
+  assert.equal(conv.sessions['zcode/wx'][0].id, 'sess_fake-fresh');
+});
+
+test('/project switches the conversation default project for bare messages', async () => {
+  const { bridge, codex, output, store, wsBrain } = await fixture({ withZcode: false });
+  await bridge.accept(message('/project brain', 'p3'));
+  await until(() => output.some(s => s.includes('默认项目已设为 brain')));
+  assert.equal(store.data.conversations['bot:owner'].currentProject, 'brain');
+  await bridge.accept(message('无前缀任务', 'p4'));
+  await until(() => codex.calls.some(c => c.method === 'thread/start'));
+  assert.equal(codex.calls.find(c => c.method === 'thread/start').params.cwd, wsBrain);
+  await bridge.accept(message('/project nope', 'p5'));
+  await until(() => output.some(s => s.includes('未知项目 nope')));
+});
+
+test('same project serializes across engines; different projects run in parallel', async () => {
+  const { bridge, codex, output, wsWx, wsBrain } = await fixture({ zcodeScript: GATED_ZCODE });
+  await bridge.accept(message('codex 占住 wx', 's1'));
+  await until(() => codex.calls.some(c => c.method === 'turn/start'));
+  // brain 与 wx 不同项目：zcode 立即开工，不等 codex。
+  await bridge.accept(message('@zcode brain brain任务', 's2'));
+  await until(() => !!bridge.backends.get('zcode').current);
+  // wx 项目被 codex 占用：zcode 的 wx 任务排在引擎队列里，不能开工。
+  await bridge.accept(message('@zcode wx wx任务', 's3'));
+  // 释放 brain 任务 → zcode 引擎轮到 wx 任务，但项目锁仍被 codex 持有 → 不 spawn。
+  await writeFile(join(wsBrain, 'gate'), 'go');
+  await until(() => output.filter(s => s.includes('zcode gated done')).length >= 1, 'brain 任务应完成');
+  await new Promise(r => setTimeout(r, 200));
+  assert.equal(bridge.backends.get('zcode').current, null);
+  assert.ok(bridge.backends.get('zcode').working, 'zcode 应在等待 wx 项目锁');
+  // 释放 codex → 锁移交 → wx 任务开工。
+  complete(codex);
+  await until(() => !!bridge.backends.get('zcode').current);
+  await writeFile(join(wsWx, 'gate'), 'go');
+  await until(() => output.filter(s => s.includes('zcode gated done')).length >= 2);
+  await until(() => !bridge.backends.get('zcode').working);
+});
+
 test('/use sets per-conversation default backend and unprefixed tasks follow it', async () => {
   const { bridge, codex, output, store } = await fixture();
   await bridge.accept(message('/use zcode'));
-  await until(() => output.some(s => s.includes('默认后端已设为 zcode')));
+  await until(() => output.some(s => s.includes('默认引擎已设为 zcode')));
   assert.equal(store.data.conversations['bot:owner'].defaultAgent, 'zcode');
   await bridge.accept(message('无前缀任务', 'm1'));
   await until(() => store.data.jobs.some(j => j.agent === 'zcode' && j.status === 'running'));
@@ -147,10 +208,11 @@ test('file modification approval includes proposed diff', async () => {
   await bridge.accept(message('/deny c1')); complete(codex); await until(() => !bridge.backends.get('codex').working);
 });
 
-test('backends run in parallel; /cancel zcode leaves codex untouched', async () => {
+test('backends run in parallel (different projects); /cancel zcode leaves codex untouched', async () => {
   const { bridge, codex, output, store } = await fixture({ zcodeScript: SLOW_ZCODE });
   await bridge.accept(message('codex 任务', 'c1')); await until(() => codex.calls.some(c => c.method === 'turn/start'));
-  await bridge.accept(message('@zcode 慢任务', 'z1'));
+  // 与 codex 不同项目，才可并行：wx 已被 codex 占用，zcode 派往 brain。
+  await bridge.accept(message('@zcode brain 慢任务', 'z1'));
   await until(() => !!bridge.backends.get('zcode').current);
   assert.ok(bridge.backends.get('codex').working, 'codex 应仍在执行');
   assert.ok(store.data.jobs.some(j => j.agent === 'zcode' && j.status === 'running'));
@@ -166,7 +228,7 @@ test('backends run in parallel; /cancel zcode leaves codex untouched', async () 
 test('/cancel without argument stops every backend', async () => {
   const { bridge, codex, output } = await fixture({ zcodeScript: SLOW_ZCODE });
   await bridge.accept(message('codex 任务', 'c1')); await until(() => codex.calls.some(c => c.method === 'turn/start'));
-  await bridge.accept(message('@zcode 慢任务', 'z1')); await until(() => !!bridge.backends.get('zcode').current);
+  await bridge.accept(message('@zcode brain 慢任务', 'z1')); await until(() => !!bridge.backends.get('zcode').current);
   await bridge.accept(message('/cancel', 'z2'));
   await until(() => !bridge.backends.get('zcode').current);
   assert.ok(codex.calls.some(c => c.method === 'turn/interrupt'));
@@ -174,34 +236,36 @@ test('/cancel without argument stops every backend', async () => {
   assert.ok(output.some(s => s.includes('已请求停止所有后端任务')));
 });
 
-test('/status lists every backend with queue and approval counts', async () => {
-  const { bridge, codex, output } = await fixture();
+test('/status lists engines and projects with queue counts', async () => {
+  const { bridge, codex, output, wsWx } = await fixture();
   await bridge.accept(message('/status', 's0'));
-  await until(() => output.some(s => s.includes('[codex]') || s.includes('codex 已连接')));
+  await until(() => output.some(s => s.includes('codex 已连接')));
   const text = output.join('\n');
   assert.ok(text.includes('codex 已连接'));
   assert.ok(text.includes('zcode'));
-  assert.ok(text.includes('工作区'));
+  assert.ok(text.includes('[项目 wx]') && text.includes(wsWx));
 });
 
-test('/list groups by backend; /switch supports backend argument', async () => {
+test('/list groups by engine/project; /switch supports engine and project arguments', async () => {
   const { bridge, codex, output, store } = await fixture();
   store.data.conversations['bot:owner'] = {
-    peerId: 'owner', defaultAgent: 'codex',
+    peerId: 'owner', defaultAgent: 'codex', currentProject: null,
     sessions: {
-      codex: [{ ref: 'thread-1', id: 'thread-1', title: '旧会话' }],
-      zcode: [{ ref: 'u1', id: 'sess_a', title: 'z 会话' }]
+      'codex/wx': [{ ref: 'thread-1', id: 'thread-1', title: '旧会话' }],
+      'zcode/wx': [{ ref: 'u1', id: 'sess_a', title: 'z 会话' }]
     },
-    current: { codex: 'thread-1', zcode: 'u1' }
+    current: { 'codex/wx': 'thread-1', 'zcode/wx': 'u1' }
   };
   await bridge.accept(message('/list', 'l1'));
-  await until(() => output.some(s => s.includes('[zcode]')));
+  await until(() => output.some(s => s.includes('[zcode/wx]')));
   const text = output.join('\n');
-  assert.ok(text.includes('[codex]') && text.includes('旧会话') && text.includes('z 会话'));
+  assert.ok(text.includes('[codex/wx]') && text.includes('旧会话') && text.includes('z 会话'));
   await bridge.accept(message('/switch zcode 1', 'l2'));
-  await until(() => output.some(s => s.includes('已切换（zcode）')));
+  await until(() => output.some(s => s.includes('已切换（zcode/wx）')));
   await bridge.accept(message('/switch 1', 'l3'));
-  await until(() => output.some(s => s.includes('已切换（codex）')));
+  await until(() => output.some(s => s.includes('已切换（codex/wx）')));
+  await bridge.accept(message('/switch codex/wx 1', 'l4'));
+  await until(() => output.some(s => s.includes('已切换（codex/wx）')));
 });
 
 test('restart marks running work uncertain and does not execute it again', async () => {
@@ -214,7 +278,7 @@ test('restart marks running work uncertain and does not execute it again', async
 
 test('resume persisted thread; early completion event is not lost', async () => {
   const { bridge, codex, output, store } = await fixture({ withZcode: false });
-  store.data.conversations['bot:owner'] = { peerId: 'owner', defaultAgent: null, sessions: { codex: [{ ref: 'thread-1', id: 'thread-1', title: 'saved' }] }, current: { codex: 'thread-1' } };
+  store.data.conversations['bot:owner'] = { peerId: 'owner', defaultAgent: null, currentProject: null, sessions: { 'codex/wx': [{ ref: 'thread-1', id: 'thread-1', project: 'wx', title: 'saved' }] }, current: { 'codex/wx': 'thread-1' } };
   const call = codex.call;
   codex.call = async (method, params) => {
     const result = await call(method, params);
@@ -253,7 +317,7 @@ test('failed durable acceptance rolls back dedup so redelivery is accepted', asy
   await until(() => codex.calls.some(c => c.method === 'turn/start')); complete(codex); await until(() => !bridge.backends.get('codex').working);
 });
 
-test('v1 state migrates to per-backend domains with a backup file', async () => {
+test('v1 state migrates to engine/project composite keys with a backup file', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-wechat-migrate-')); const path = join(dir, 'state.json');
   await writeFile(path, JSON.stringify({
     version: 1,
@@ -262,27 +326,78 @@ test('v1 state migrates to per-backend domains with a backup file', async () => 
     jobs: [{ id: 'j1', status: 'pending', message: { text: '旧任务', conversationId: 'bot:owner', peerId: 'owner' } }]
   }, null, 2));
   const store = await new Storage(path).load();
-  assert.equal(store.data.schemaVersion, 2);
+  assert.equal(store.data.schemaVersion, 3);
   const conv = store.data.conversations['bot:owner'];
-  assert.equal(conv.sessions.codex.length, 1);
-  assert.equal(conv.sessions.codex[0].id, 'thread-9');
-  assert.equal(conv.sessions.codex[0].ref, 'thread-9');
-  assert.equal(conv.current.codex, 'thread-9');
+  assert.equal(conv.sessions['codex/codex'].length, 1);
+  assert.equal(conv.sessions['codex/codex'][0].id, 'thread-9');
+  assert.equal(conv.sessions['codex/codex'][0].ref, 'thread-9');
+  assert.equal(conv.current['codex/codex'], 'thread-9');
   assert.equal(store.data.jobs[0].agent, 'codex');
+  assert.equal(store.data.jobs[0].project, 'codex');
   assert.ok((await readdir(dir)).some(f => f.startsWith('state.json.bak-')));
   await store.save();
-  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 2);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).schemaVersion, 3);
 });
 
-test('legacy single-backend config maps to one codex agent', async () => {
+test('v2 state migrates bare engine keys to composite keys', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-wechat-migrate2-')); const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({
+    schemaVersion: 2,
+    conversations: { 'bot:owner': { peerId: 'owner', sessions: { codex: [{ ref: 't1', id: 't1', title: 'A' }], zcode: [{ ref: 'u1', id: null, title: 'B' }] }, current: { codex: 't1' }, defaultAgent: null } },
+    seen: [], jobs: [{ id: 'j1', status: 'pending', agent: 'zcode', message: { text: '任务', conversationId: 'bot:owner', peerId: 'owner' } }]
+  }, null, 2));
+  const store = await new Storage(path).load();
+  assert.equal(store.data.schemaVersion, 3);
+  const conv = store.data.conversations['bot:owner'];
+  assert.deepEqual(Object.keys(conv.sessions).sort(), ['codex/codex', 'zcode/zcode']);
+  assert.equal(conv.sessions['zcode/zcode'][0].title, 'B');
+  assert.equal(conv.current['codex/codex'], 't1');
+  assert.equal(store.data.jobs[0].project, 'zcode');
+  assert.ok((await readdir(dir)).some(f => f.startsWith('state.json.bak-')));
+});
+
+test('legacy single-backend config maps to one codex agent plus same-name project', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'codex-wechat-cfg-')); const path = join(dir, 'config.json');
   await writeFile(path, JSON.stringify({ workspace: 'D:/tmp/legacy-ws', codexPath: 'C:/tools/codex.exe', permissionMode: 'workspace', model: null, maxReplyChars: 3000 }));
   const config = await loadConfig(path);
   assert.deepEqual(Object.keys(config.agents), ['codex']);
   assert.equal(config.agents.codex.adapter, 'codex-app-server');
   assert.equal(config.agents.codex.executable, 'C:/tools/codex.exe');
-  assert.equal(config.agents.codex.workspace, resolve('D:/tmp/legacy-ws'));
+  assert.equal(config.agents.codex.workspace, undefined);
+  assert.deepEqual(Object.keys(config.projects), ['codex']);
+  assert.equal(config.projects.codex.workspace, resolve('D:/tmp/legacy-ws'));
   assert.equal(config.defaultAgent, 'codex');
+  assert.equal(config.defaultProject, 'codex');
+});
+
+test('phase-1 agents config (workspace per entry) splits into engine plus same-name projects', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-wechat-cfg1b-')); const path = join(dir, 'config.json');
+  await writeFile(path, JSON.stringify({ agents: {
+    codex: { adapter: 'codex-app-server', workspace: 'D:/tmp/ws-a', permissionMode: 'workspace' },
+    zcode: { adapter: 'zcode-headless', cli: 'D:/AI/ZCode/resources/glm/zcode.cjs', workspace: 'D:/tmp/ws-b', mode: 'yolo' }
+  } }));
+  const config = await loadConfig(path);
+  assert.equal(config.projects.codex.workspace, resolve('D:/tmp/ws-a'));
+  assert.equal(config.projects.zcode.workspace, resolve('D:/tmp/ws-b'));
+  assert.equal(config.agents.codex.workspace, undefined);
+  assert.equal(config.defaultProject, 'codex');
+});
+
+test('agents + projects config: engine entries carry no workspace; projects validated', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-wechat-cfg4-')); const path = join(dir, 'config.json');
+  const base = { defaultAgent: 'codex', defaultProject: 'wx', agents: {
+    codex: { adapter: 'codex-app-server', permissionMode: 'workspace' },
+    zcode: { adapter: 'zcode-headless', cli: 'D:/AI/ZCode/resources/glm/zcode.cjs', mode: 'yolo' }
+  }, projects: { wx: { workspace: 'D:/tmp/wx' }, brain: { workspace: 'D:/tmp/brain' } } };
+  await writeFile(path, JSON.stringify(base));
+  const config = await loadConfig(path);
+  assert.equal(config.projects.brain.workspace, resolve('D:/tmp/brain'));
+  assert.equal(config.defaultProject, 'wx');
+  // 项目间工作区冲突同样拒绝
+  await writeFile(path, JSON.stringify({ ...base, projects: { wx: { workspace: 'D:/tmp/same' }, brain: { workspace: 'D:/tmp/same' } } }));
+  await assert.rejects(loadConfig(path), /工作区相同/);
+  await writeFile(path, JSON.stringify({ ...base, projects: { wx: { workspace: 'D:/tmp/wx' }, 'bad id': { workspace: 'D:/tmp/x' } } }));
+  await assert.rejects(loadConfig(path), /项目 id 无效/);
 });
 
 test('new agents config: shared workspace is rejected unless explicitly allowed', async () => {

@@ -15,66 +15,102 @@ import { CodexBackend, ZcodeBackend, resolveCodexExecutable } from './backend.mj
 import { Bridge } from './bridge.mjs';
 import { runtimeStatus, launchBackground, requestStop, watchStop } from './lifecycle.mjs';
 
-function normalizeAgents(custom) {
-  if (custom.agents !== undefined) {
-    if (!custom.agents || typeof custom.agents !== 'object' || Array.isArray(custom.agents) || !Object.keys(custom.agents).length) throw new Error('agents 必须是非空对象');
-    const agents = {};
-    for (const [id, raw] of Object.entries(custom.agents)) {
-      if (!/^[a-z][a-z0-9-]*$/.test(id)) throw new Error(`后端 id 无效（小写字母开头，可含数字/-）：${id}`);
-      if (!raw || typeof raw !== 'object') throw new Error(`agents.${id} 必须是对象`);
-      if (!raw.workspace || typeof raw.workspace !== 'string') throw new Error(`agents.${id}.workspace 必填`);
-      const agent = { ...raw };
-      if (agent.adapter === 'codex-app-server') {
-        agent.permissionMode ??= 'workspace';
-        if (!['workspace', 'full'].includes(agent.permissionMode)) throw new Error(`agents.${id}.permissionMode 只能是 workspace 或 full`);
-        if (agent.model !== undefined && typeof agent.model !== 'string' && agent.model !== null) throw new Error(`agents.${id}.model 只能是字符串或 null`);
-        agent.model ??= null;
-        if (typeof agent.executable !== 'undefined' && typeof agent.executable !== 'string') throw new Error(`agents.${id}.executable 无效`);
-        agent.executable ??= 'codex';
-      } else if (agent.adapter === 'zcode-headless') {
-        if (!agent.cli || typeof agent.cli !== 'string') throw new Error(`agents.${id}.cli 必填（zcode.cjs 绝对路径）`);
-        agent.node ??= 'node';
-        agent.mode ??= 'yolo';
-        if (!['build', 'edit', 'plan', 'yolo', 'guarded'].includes(agent.mode)) throw new Error(`agents.${id}.mode 只能是 build/edit/plan/yolo/guarded`);
-        agent.locale ??= 'zh-CN';
-      } else throw new Error(`agents.${id}.adapter 未知：${agent.adapter}（支持 codex-app-server、zcode-headless）`);
-      agents[id] = agent;
-    }
-    return agents;
+const ID_RE = /^[a-z][a-z0-9-]*$/;
+
+function normalizeAgentBody(id, raw) {
+  if (!raw || typeof raw !== 'object') throw new Error(`agents.${id} 必须是对象`);
+  const agent = { ...raw };
+  delete agent.workspace; // workspace 属于 projects，不留在引擎条目上
+  if (agent.adapter === 'codex-app-server') {
+    agent.permissionMode ??= 'workspace';
+    if (!['workspace', 'full'].includes(agent.permissionMode)) throw new Error(`agents.${id}.permissionMode 只能是 workspace 或 full`);
+    if (agent.model !== undefined && typeof agent.model !== 'string' && agent.model !== null) throw new Error(`agents.${id}.model 只能是字符串或 null`);
+    agent.model ??= null;
+    if (typeof agent.executable !== 'undefined' && typeof agent.executable !== 'string') throw new Error(`agents.${id}.executable 无效`);
+    agent.executable ??= 'codex';
+  } else if (agent.adapter === 'zcode-headless') {
+    if (!agent.cli || typeof agent.cli !== 'string') throw new Error(`agents.${id}.cli 必填（zcode.cjs 绝对路径）`);
+    agent.node ??= 'node';
+    agent.mode ??= 'yolo';
+    if (!['build', 'edit', 'plan', 'yolo', 'guarded'].includes(agent.mode)) throw new Error(`agents.${id}.mode 只能是 build/edit/plan/yolo/guarded`);
+    agent.locale ??= 'zh-CN';
+  } else throw new Error(`agents.${id}.adapter 未知：${agent.adapter}（支持 codex-app-server、zcode-headless）`);
+  return agent;
+}
+
+// 引擎（agents）与项目（projects）正交：agent 只描述引擎参数，workspace 全部挂在 projects 上。
+// 兼容两种旧形态：① agents 条目自带 workspace（一期多后端）→ 每条目拆出同名项目；
+// ② 无 agents 的单后端配置 → 单 codex 引擎 + 单项目。
+function normalizeRegistries(custom) {
+  if (custom.agents === undefined) {
+    const codexPath = custom.codexPath ?? 'codex';
+    if (typeof codexPath !== 'string' || !codexPath) throw new Error('codexPath 无效');
+    if (custom.permissionMode !== undefined && !['workspace', 'full'].includes(custom.permissionMode)) throw new Error('permissionMode 只能是 workspace 或 full');
+    console.error('提示：检测到旧版单后端配置，已按单一 codex 引擎 + 同名项目读取；建议迁移到 agents + projects 结构（参考 config.example.json）。');
+    return {
+      agents: { codex: { adapter: 'codex-app-server', executable: codexPath, permissionMode: custom.permissionMode ?? 'workspace', model: custom.model ?? null } },
+      projects: { codex: { workspace: custom.workspace || process.cwd() } }
+    };
   }
-  // 旧版单后端配置兼容：等价于只配一个 codex 后端。
-  const codexPath = custom.codexPath ?? 'codex';
-  if (typeof codexPath !== 'string' || !codexPath) throw new Error('codexPath 无效');
-  if (custom.permissionMode !== undefined && !['workspace', 'full'].includes(custom.permissionMode)) throw new Error('permissionMode 只能是 workspace 或 full');
-  console.error('提示：检测到旧版单后端配置，已按单一 codex 后端读取；建议迁移到 agents 结构（参考 config.example.json）。');
-  return { codex: { adapter: 'codex-app-server', executable: codexPath, workspace: custom.workspace || process.cwd(), permissionMode: custom.permissionMode ?? 'workspace', model: custom.model ?? null } };
+  if (!custom.agents || typeof custom.agents !== 'object' || Array.isArray(custom.agents) || !Object.keys(custom.agents).length) throw new Error('agents 必须是非空对象');
+  const agents = {};
+  const legacyWorkspaces = {};
+  let legacy = false;
+  for (const [id, raw] of Object.entries(custom.agents)) {
+    if (!ID_RE.test(id)) throw new Error(`引擎 id 无效（小写字母开头，可含数字/-）：${id}`);
+    if (raw && typeof raw === 'object' && raw.workspace !== undefined) {
+      if (typeof raw.workspace !== 'string' || !raw.workspace) throw new Error(`agents.${id}.workspace 必须是非空字符串`);
+      legacyWorkspaces[id] = raw.workspace; legacy = true;
+    }
+    agents[id] = normalizeAgentBody(id, raw);
+  }
+  let projects;
+  if (custom.projects !== undefined) {
+    if (!custom.projects || typeof custom.projects !== 'object' || Array.isArray(custom.projects) || !Object.keys(custom.projects).length) throw new Error('projects 必须是非空对象');
+    if (legacy) console.error('提示：agents 条目内的 workspace 字段已忽略（项目目录以 projects 为准）；建议从 agents 中删除 workspace。');
+    projects = {};
+    for (const [id, raw] of Object.entries(custom.projects)) {
+      if (!ID_RE.test(id)) throw new Error(`项目 id 无效（小写字母开头，可含数字/-）：${id}`);
+      if (!raw || typeof raw !== 'object' || !raw.workspace || typeof raw.workspace !== 'string') throw new Error(`projects.${id}.workspace 必填`);
+      projects[id] = { workspace: raw.workspace };
+    }
+  } else {
+    if (!legacy) throw new Error('projects 未定义且 agents 未携带 workspace：请在 config 增加 projects 节（项目 id → workspace），或回退一期写法（agents 条目自带 workspace）');
+    console.error('提示：检测到一期写法（agents 条目自带 workspace），已按「每引擎一个同名项目」拆分；建议迁移到 projects 结构（参考 config.example.json）。');
+    projects = Object.fromEntries(Object.entries(legacyWorkspaces).map(([id, workspace]) => [id, { workspace }]));
+  }
+  return { agents, projects };
 }
 
 export async function loadConfig(file = resolve('config.json')) {
   let custom = {};
   try { custom = JSON.parse(await readFile(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  const config = { maxReplyChars: 3000, allowSharedWorkspace: false, ...custom, agents: normalizeAgents(custom) };
+  const { agents, projects } = normalizeRegistries(custom);
+  const config = { maxReplyChars: 3000, allowSharedWorkspace: false, ...custom, agents, projects };
   if (!Number.isInteger(config.maxReplyChars) || config.maxReplyChars < 100 || config.maxReplyChars > 4000) throw new Error('maxReplyChars 必须为 100–4000 的整数');
-  const ids = Object.keys(config.agents);
-  config.defaultAgent ||= ids.includes('codex') ? 'codex' : ids[0];
-  if (!config.agents[config.defaultAgent]) throw new Error(`defaultAgent ${config.defaultAgent} 未在 agents 中定义`);
+  const agentIds = Object.keys(agents);
+  config.defaultAgent ||= agentIds.includes('codex') ? 'codex' : agentIds[0];
+  if (!agents[config.defaultAgent]) throw new Error(`defaultAgent ${config.defaultAgent} 未在 agents 中定义`);
+  const projectIds = Object.keys(projects);
+  config.defaultProject ||= projectIds[0];
+  if (!projects[config.defaultProject]) throw new Error(`defaultProject ${config.defaultProject} 未在 projects 中定义`);
   const letters = new Set();
-  for (const id of ids) {
-    if (letters.has(id[0])) throw new Error(`后端 ${id} 与其他后端 id 首字母重复，审批编号无法区分，请改名`);
+  for (const id of agentIds) {
+    if (letters.has(id[0])) throw new Error(`引擎 ${id} 与其他引擎 id 首字母重复，审批编号无法区分，请改名`);
     letters.add(id[0]);
   }
+  for (const id of projectIds) projects[id].workspace = resolve(projects[id].workspace);
   const byWorkspace = new Map();
-  for (const id of ids) {
-    const agent = config.agents[id];
-    agent.workspace = resolve(agent.workspace);
-    const prev = byWorkspace.get(agent.workspace);
+  for (const id of projectIds) {
+    const workspace = projects[id].workspace;
+    const prev = byWorkspace.get(workspace);
     if (prev) {
-      if (!config.allowSharedWorkspace) throw new Error(`后端 ${prev} 与 ${id} 工作区相同（${agent.workspace}）；后端并行执行会写冲突。请分离工作区，或显式设置 "allowSharedWorkspace": true`);
-      config.sharedWorkspaceWarning = `后端 ${prev} 与 ${id} 共享工作区 ${agent.workspace}，并行执行可能写冲突`;
+      if (!config.allowSharedWorkspace) throw new Error(`项目 ${prev} 与 ${id} 工作区相同（${workspace}）；不同项目并行执行会写冲突。请分离工作区，或显式设置 "allowSharedWorkspace": true`);
+      config.sharedWorkspaceWarning = `项目 ${prev} 与 ${id} 共享工作区 ${workspace}，并行执行可能写冲突`;
     }
-    byWorkspace.set(agent.workspace, id);
+    byWorkspace.set(workspace, id);
   }
-  const primary = config.agents[config.defaultAgent].workspace;
+  const primary = projects[config.defaultProject].workspace;
   const workspaceKey = createHash('sha256').update(process.platform === 'win32' ? primary.toLowerCase() : primary).digest('hex').slice(0, 12);
   config.stateDir = resolve(custom.stateDir || join(homedir(), '.codex-wechat', workspaceKey));
   return config;
@@ -85,9 +121,9 @@ async function createBackends(config) {
   for (const [id, agent] of Object.entries(config.agents)) {
     if (agent.adapter === 'codex-app-server') {
       const executable = await resolveCodexExecutable(agent.executable);
-      backends.set(id, new CodexBackend({ id, workspace: agent.workspace, permissionMode: agent.permissionMode, model: agent.model, executable }));
+      backends.set(id, new CodexBackend({ id, permissionMode: agent.permissionMode, model: agent.model, executable }));
     } else {
-      backends.set(id, new ZcodeBackend({ id, workspace: agent.workspace, node: agent.node, cli: agent.cli, mode: agent.mode, locale: agent.locale }));
+      backends.set(id, new ZcodeBackend({ id, node: agent.node, cli: agent.cli, mode: agent.mode, locale: agent.locale }));
     }
   }
   return backends;
@@ -138,16 +174,20 @@ async function doctor(config, store) {
       try {
         await client.initialize();
         const account = await client.call('account/read', {});
-        lines.push(`[${id}] codex app-server：握手成功；登录：${account.account ? '已登录' : '未登录'}；程序：${executable}；权限 ${agent.permissionMode}；工作区 ${agent.workspace}`);
+        lines.push(`[${id}] codex app-server：握手成功；登录：${account.account ? '已登录' : '未登录'}；程序：${executable}；权限 ${agent.permissionMode}`);
       } catch (e) { lines.push(`[${id}] codex app-server 握手失败（${executable}）：${e.message}`); }
       finally { client.close(); }
     } else {
       const cliExists = await stat(agent.cli).then(() => true, () => false);
       const nodeOk = spawnSync(agent.node, ['--version'], { timeout: 15000, windowsHide: true }).status === 0;
-      lines.push(`[${id}] zcode headless：node ${nodeOk ? '可用' : '不可用'}；cli ${cliExists ? '存在' : '缺失'}（${agent.cli}）；模式 ${agent.mode}（无审批转发，建议独立可抛弃工作区）；工作区 ${agent.workspace}${cliExists ? '；请确认已 zcode login' : ''}`);
+      lines.push(`[${id}] zcode headless：node ${nodeOk ? '可用' : '不可用'}；cli ${cliExists ? '存在' : '缺失'}（${agent.cli}）；模式 ${agent.mode}（无审批转发，建议项目工作区独立可抛弃）${cliExists ? '；请确认已 zcode login' : ''}`);
     }
   }
-  lines.push(`微信：${store.data.account?.userId ? '已绑定' : '未绑定'}；默认后端：${config.defaultAgent}；状态目录：${config.stateDir}`);
+  for (const [id, project] of Object.entries(config.projects)) {
+    const exists = await stat(project.workspace).then(s => s.isDirectory(), () => false);
+    lines.push(`[项目 ${id}] ${exists ? '工作区存在' : '工作区缺失'}：${project.workspace}`);
+  }
+  lines.push(`微信：${store.data.account?.userId ? '已绑定' : '未绑定'}；默认引擎：${config.defaultAgent}；默认项目：${config.defaultProject}；状态目录：${config.stateDir}`);
   if (config.sharedWorkspaceWarning) lines.push(`⚠ ${config.sharedWorkspaceWarning}`);
   console.log(lines.join('\n'));
   console.log('此检查未调用模型，未访问微信。');
@@ -202,7 +242,7 @@ async function start(store, config) {
   const stopWatching = await watchStop(config.stateDir, () => { signal.abort(); for (const backend of backends.values()) backend.close(); }, log);
   const heartbeat = setInterval(() => { runtime.heartbeatAt = new Date().toISOString(); saveRuntime().catch(e => log(e.message)); }, 10000);
   try {
-    console.log(`微信桥接已启动（后端：${[...backends.keys()].join('、')}；默认 ${config.defaultAgent}）；Ctrl+C 停止。`);
+    console.log(`微信桥接已启动（引擎：${[...backends.keys()].join('、')}；项目：${Object.keys(config.projects).join('、')}；默认 ${config.defaultAgent}/${config.defaultProject}）；Ctrl+C 停止。`);
     await bridge.recover();
     const reason = await monitor.run(signal.signal);
     if (reason === 'stale-token') throw new Error('微信凭据失效，请停止后重新 npm run login');
@@ -221,7 +261,7 @@ async function main() {
   // Windows child processes and native networking require these standard variables.
   if (process.platform === 'win32') { process.env.SystemRoot ||= 'C:\\Windows'; process.env.WINDIR ||= process.env.SystemRoot; }
   const config = await loadConfig();
-  for (const agent of Object.values(config.agents)) await mkdir(agent.workspace, { recursive: true });
+  for (const project of Object.values(config.projects)) await mkdir(project.workspace, { recursive: true });
   await mkdir(config.stateDir, { recursive: true });
   if (command === 'status') { console.log(JSON.stringify(await runtimeStatus(config.stateDir), null, 2)); return; }
   if (command === 'stop') { await requestStop(config.stateDir); console.log('已请求停止后台桥接。'); return; }

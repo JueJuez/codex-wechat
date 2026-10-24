@@ -9,11 +9,12 @@
 
 ## 当前状态
 
-多后端一期已完成并通过真机验证：一个微信号同时指挥 Codex 与 ZCode 两个本机后端，各后端独立队列并行执行，
-`@前缀` 路由、`[平台]` 回传标识、按后端命名的审批编号（`/approve c1`）、逐后端 `/status`。
+多后端一期已完成并通过真机验证；二期「引擎 × 项目」正交拆分已完成代码与单测（40 项全绿）：
+agents（引擎）与 projects（项目目录）分注册，`@引擎 [项目] 任务` 两段式路由，同项目跨引擎串行。
+一期能力：一个微信号同时指挥 Codex 与 ZCode，`[平台]` 回传标识、按引擎命名的审批编号（`/approve c1`）、逐引擎 `/status`。
 Codex 真实命令执行与文件读写、ZCode headless 两轮会话续接（`--resume`）、微信真机两后端并行联调
 （含停机期间消息补收）均已验证，记录见 [docs/VALIDATION.md](docs/VALIDATION.md)。
-尚未真机验证：附件发到多后端、`/approve c1` 真机操作、`/cancel zcode` 中途取消。
+尚未真机验证：二期 `@引擎 项目` 路由与跨引擎同项目串行、附件发到多后端、`/approve c1` 真机操作、`/cancel zcode` 中途取消。
 
 ## Windows 启动
 
@@ -56,40 +57,47 @@ npm start
 ## 配置
 
 复制 [config.example.json](config.example.json) 为 `config.json` 后按需修改。
-关键约束：**不同后端的 `workspace` 必须指向不同目录**（后端并行执行，共享目录会写冲突）；
+配置分两个正交维度：**agents**（引擎：codex / zcode，只写引擎参数）与 **projects**（项目：id → workspace 目录）。
+任意引擎可操作任意项目；**同一项目同一时刻只有一个任务在改**（跨引擎也串行），不同项目之间并行。
+
+关键约束：**不同项目的 `workspace` 必须指向不同目录**（不同项目并行执行，共享目录会写冲突）；
 确要共享必须显式设置 `"allowSharedWorkspace": true`，此时 `/status` 会常驻提示风险。
 
-- `codex` 后端：`executable` 可省略或填 `"codex"`，桥接会按「显式路径 → `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe` 最新版 → PATH」自动发现（ChatGPT 桌面版捆绑目录随升级漂移）。
-- `zcode` 后端：`cli` 填 zcode.cjs 绝对路径（桌面版捆绑为 `D:/AI/ZCode/resources/glm/zcode.cjs`）；使用前先 `zcode login`。`mode` 默认 `yolo`（全自动），**没有中途审批通道，等于预授权放行**，务必给它独立、可抛弃的 workspace。
-- 旧版单后端配置（顶层 `workspace`/`codexPath`/`permissionMode`/`model`）不改一行仍可运行：等价于只配一个 codex 后端，启动时有迁移提示。
-- `defaultAgent` 是无前缀任务的默认后端，缺省 `codex`。
+- `codex` 引擎：`executable` 可省略或填 `"codex"`，桥接会按「显式路径 → `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe` 最新版 → PATH」自动发现（ChatGPT 桌面版捆绑目录随升级漂移）。
+- `zcode` 引擎：`cli` 填 zcode.cjs 绝对路径（桌面版捆绑为 `D:/AI/ZCode/resources/glm/zcode.cjs`）；使用前先 `zcode login`。`mode` 默认 `yolo`（全自动），**没有中途审批通道，等于预授权放行**，务必让它的项目 workspace 独立、可抛弃。
+- 一期写法（agents 条目自带 workspace）仍可运行：自动按「每引擎一个同名项目」拆分，启动时有迁移提示。
+- 更早的单后端配置（顶层 `workspace`/`codexPath`/`permissionMode`/`model`）不改一行仍可运行：等价于单 codex 引擎 + 同名项目。
+- `defaultAgent` / `defaultProject` 是无前缀任务的默认引擎与项目。
 
 ## 微信用法
 
-直接发送任务（交给默认后端），或用 `@后端` 指定：
+直接发送任务（交给默认引擎 × 当前项目），或用 `@引擎 [项目]` 指定：
 
 ```
-@codex 修复登录页测试失败，修完报告
-@zcode 调研一下 XX 库的缓存设计，写个对比文档
-[zcode] 已收到，zcode 开始处理。   ← 回执带平台标识
-[zcode] 任务完成：…               ← 结果带平台标识
+@codex brain 调研一下 XX 库的缓存设计，写个对比文档
+@zcode wx 修复登录页测试失败，修完报告
+[zcode] 已收到，zcode → brain 开始处理。   ← 回执带引擎与项目
+[zcode] 任务完成：…                       ← 结果带引擎标识
 ```
 
-首次自动创建会话，后续消息持续使用同一会话；同一后端内任务串行，后端之间并行，回传可能交错。
+`@` 后第二段若命中已注册项目 id（如 `brain`）则作为目标项目，否则整句为任务、发往当前项目。
+首次自动创建会话，后续消息持续使用同一会话（按 引擎/项目 分域）；同一引擎内任务串行，
+同一项目跨引擎也串行，不同项目之间并行，回传可能交错。
 
 | 命令 | 作用 |
 |---|---|
-| `@codex 任务` / `@zcode 任务` | 指定后端执行 |
-| `/use zcode` | 设置本会话默认后端（重启后保持） |
-| `/new 标题` | 创建新会话（默认后端） |
-| `/list` | 会话列表（按后端分组） |
-| `/switch [后端] 2` | 按列表序号切换，可带后端 |
-| `/current` | 查看各后端当前会话 |
-| `/status` | 逐后端：连接 / 运行 / 排队 / 审批 / 工作区 |
-| `/cancel [后端]` | 取消任务并清空排队；不带参数作用于全部后端 |
-| `/approve c1` / `/deny c1` | 同意或拒绝指定审批（编号按后端命名：c=codex，z=zcode） |
+| `@zcode brain 任务` | 指定引擎（可选项目）执行 |
+| `/use zcode` | 设置本会话默认引擎（重启后保持） |
+| `/project brain` | 设置本会话默认项目（重启后保持） |
+| `/new [项目] 标题` | 创建新会话（默认引擎） |
+| `/list` | 会话列表（按 引擎/项目 分组） |
+| `/switch [引擎[/项目]] 2` | 按列表序号切换，可带域 |
+| `/current` | 当前引擎、项目与各域当前会话 |
+| `/status` | 逐引擎：连接 / 运行 / 排队 / 审批；逐项目：占用与排队 |
+| `/cancel [引擎]` | 取消任务并清空排队；不带参数作用于全部引擎 |
+| `/approve c1` / `/deny c1` | 同意或拒绝指定审批（编号按引擎命名：c=codex，z=zcode） |
 | `/answer c1 question_id 回答` | 回答指定问题；多问题需逐一回答 |
-| `/send outputs/result.txt` | 发送默认后端工作目录内文件到微信 |
+| `/send outputs/result.txt` | 发送当前项目工作目录内文件到微信 |
 | `/help` | 查看命令 |
 
 手机发来的文件会保存到目标后端工作目录 `.codex-wechat/inbox/`，路径随任务传入；图片作为本机图片输入（ZCode 以附件形式 `--attach`）。
@@ -116,8 +124,8 @@ Windows 文件保护依赖用户目录 ACL；POSIX 同时使用 0600 文件模�
 同一状态目录只允许运行一个桥接或登录进程；不要与其他客户端同时轮询同一绑定。
 首次绑定其他客户端已使用的微信账号可能影响既有绑定，请使用当前打算连接的账号。
 
-状态文件 `schemaVersion: 2`：会话按后端分域（`sessions.codex` / `sessions.zcode`）。
-旧版 v1 状态首次启动自动迁移（全部归入 codex 域），迁移前在状态目录留 `state.json.bak-<时间戳>` 备份。
+状态文件 `schemaVersion: 3`：会话按「引擎/项目」复合键分域（`sessions["codex/wx"]`）。
+旧版 v1/v2 状态首次启动自动迁移（v2 的纯引擎键映射为 `引擎/引擎`），迁移前在状态目录留 `state.json.bak-<时间戳>` 备份。
 
 接受消息时先持久化入站队列，再推进微信游标；有 messageId 的消息去重。
 重启后等待中的任务继续排队，已开始但中断的任务报告“结果未知”，不会自动重跑命令。
