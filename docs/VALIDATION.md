@@ -1,5 +1,15 @@
 # 验证记录
 
+日期：2026-10-25，Windows 本机（桌面会话接管 + 内联 /new，代码级验证；plan 见 [02-plan/desktop-adopt-plan.md](02-plan/desktop-adopt-plan.md)）。
+
+已验证（2026-10-25）：
+
+- `npm test` 42 项全绿。新增覆盖：`@引擎 [项目] /new 任务` 内联新会话（强制新开、后续续新会话、无任务降级为就地新建且用 @ 的引擎、任务正文中 `/new` 不误判）、`/adopt`（绑定后消息 `--resume` 被接管会话、重复 adopt 幂等）。
+- 桌面 resume 探针（4 项，未污染任何桌面会话）：桌面与 headless 会话同库（`~/.zcode/cli/db/db.sqlite`）；headless `--resume` 续 headless 会话成功；`--resume` 可解析桌面 `session_` 前缀 id 但 turn 报 "Select a model"——根因是桌面会话绑定 `account:` 套餐 provider、headless 默认 `new-provider/deepseek-v4.1-flash`。结论：接管前提 = 桌面模型切到共享 provider。
+- `scripts/notify.mjs --dry`：自动识别当前桌面会话 id、config 反查项目、拼出 `/adopt` 命令正确（真机发送未验）。
+
+待测（2026-10-26 计划）：桌面切共享 provider 后 resume 桌面会话探针 → notify 真机发送 → `/adopt` 端到端 → 重启桥接后二期真机联调（`@引擎 项目` 路由、内联 `/new`、同项目串行）。
+
 日期：2026-10-24，Windows 本机（二期「引擎×项目」拆分，代码级验证）。
 
 已验证（2026-10-24，单测与配置级，**未真机联调**）：

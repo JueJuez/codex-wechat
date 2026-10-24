@@ -9,12 +9,19 @@
 
 ## 当前状态
 
-多后端一期已完成并通过真机验证；二期「引擎 × 项目」正交拆分已完成代码与单测（40 项全绿）：
-agents（引擎）与 projects（项目目录）分注册，`@引擎 [项目] 任务` 两段式路由，同项目跨引擎串行。
+多后端一期已完成并通过真机验证；二期「引擎 × 项目」正交拆分已完成代码与单测，另有两个增量（单测全绿，42 项）：
+
+- **内联新会话**（b01c29e）：`@引擎 [项目] /new 任务` 强制新开会话执行，`/new` 可放在项目名前；不带任务时就地新建。
+- **桌面会话接管**（c255c88）：桌面任务执行 `node scripts/notify.mjs "任务完成：XX"` 发微信通知（附现成 `/adopt` 命令），
+  微信回复 `/adopt zcode/wx session_xxx` 后续消息直接续接桌面会话。前提与探针记录见
+  [docs/02-plan/desktop-adopt-plan.md](docs/02-plan/desktop-adopt-plan.md)。
+  主体能力：agents（引擎）与 projects（项目目录）分注册，`@引擎 [项目] 任务` 两段式路由，同项目跨引擎串行。
+
 一期能力：一个微信号同时指挥 Codex 与 ZCode，`[平台]` 回传标识、按引擎命名的审批编号（`/approve c1`）、逐引擎 `/status`。
 Codex 真实命令执行与文件读写、ZCode headless 两轮会话续接（`--resume`）、微信真机两后端并行联调
 （含停机期间消息补收）均已验证，记录见 [docs/VALIDATION.md](docs/VALIDATION.md)。
-尚未真机验证：二期 `@引擎 项目` 路由与跨引擎同项目串行、附件发到多后端、`/approve c1` 真机操作、`/cancel zcode` 中途取消。
+尚未真机验证（2026-10-26 计划）：桌面切共享 provider 后 resume 桌面会话探针、notify 真机发送、`/adopt` 端到端、
+二期 `@引擎 项目` 路由与跨引擎同项目串行、内联 `/new` 真机、附件发到多后端、`/approve c1` 真机操作、`/cancel zcode` 中途取消。
 
 ## Windows 启动
 
