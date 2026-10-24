@@ -3,7 +3,7 @@ import { realpath, stat } from 'node:fs/promises';
 import { join, relative, isAbsolute, resolve } from 'node:path';
 import { sessionId8 } from './backend.mjs';
 
-export const HELP = '@引擎 [项目] 任务 指定引擎与项目执行（如 @zcode brain 调研 X）\n/use 引擎 设置本会话默认引擎\n/project 项目 设置本会话默认项目\n/new [项目] [标题] 新会话\n/list 会话列表（按 引擎/项目 分组）\n/switch [引擎[/项目]] 序号 切换会话\n/current 当前引擎、项目与会话\n/status 引擎与项目状态\n/cancel [引擎] 取消任务及排队消息\n/approve 编号 同意一次（编号形如 c1）\n/deny 编号 拒绝\n/answer 编号 问题ID 回答\n/send 路径 回传当前项目工作区文件\n/help 帮助';
+export const HELP = '@引擎 [项目] [/new] 任务 指定引擎与项目执行（如 @zcode brain 调研 X）；带 /new 强制新开会话（如 @zcode wx /new 任务，项目缺省用当前默认）\n/use 引擎 设置本会话默认引擎\n/project 项目 设置本会话默认项目\n/new [项目] [标题] 新会话\n/list 会话列表（按 引擎/项目 分组）\n/switch [引擎[/项目]] 序号 切换会话\n/current 当前引擎、项目与会话\n/status 引擎与项目状态\n/cancel [引擎] 取消任务及排队消息\n/approve 编号 同意一次（编号形如 c1）\n/deny 编号 拒绝\n/answer 编号 问题ID 回答\n/send 路径 回传当前项目工作区文件\n/help 帮助';
 
 export async function confinedFile(workspace, target) {
   const root = await realpath(workspace);
@@ -72,6 +72,7 @@ export class Bridge {
     if (this.store.data.jobs.length >= 100) throw new Error('待处理消息已达 100 条，请先取消或等待');
     let agentId = null;
     let projectId = null;
+    let newSession = false;
     if (!message.text.startsWith('/')) {
       const at = /^@([A-Za-z][A-Za-z0-9-]*)(?:\s+([\s\S]+))?$/.exec(message.text.trim());
       if (at) {
@@ -84,13 +85,38 @@ export class Bridge {
           return this.reply(message, `请在 @${backend.id} 后写任务内容，也可带项目：@${backend.id} ${this.config.defaultProject} 列出当前目录`);
         }
         // 第二段命中已注册项目 id 则消费为项目，否则整句为任务、用当前项目。
+        // 消息内联 /new（开头或项目名后）表示强制新开会话再执行；无任务时降级为 /new 命令。
         let rest = at[2].trim();
+        let inlineNew = false;
+        const stripNew = s => {
+          const m = /^\/new(?:\s+([\s\S]*))?$/.exec(s);
+          if (!m) return null;
+          inlineNew = true;
+          return (m[1] || '').trim();
+        };
+        const stripped = stripNew(rest);
+        if (stripped !== null) rest = stripped;
         const lead = /^([a-z][a-z0-9-]*)(?:\s+([\s\S]+))?$/.exec(rest);
         if (lead && this.config.projects[lead[1]]) {
-          if (!lead[2]) return this.reply(message, `已指定项目 ${lead[1]} 但任务内容为空，例如：@${backend.id} ${lead[1]} 列出当前目录`);
           projectId = lead[1];
-          rest = lead[2].trim();
+          rest = (lead[2] || '').trim();
+          const stripped2 = stripNew(rest);
+          if (stripped2 !== null) rest = stripped2;
         } else projectId = this.currentProjectId(conv);
+        if (inlineNew && !rest) {
+          // @引擎 [项目] /new 无任务：就地用 @ 的引擎新建会话（/new 命令用的是会话默认引擎，会选错）。
+          if (this.commandTasks(message.conversationId, backend.id).length) {
+            this.recordSeen(key);
+            return this.reply(message, `请先 /cancel ${backend.id} 或等任务完成再新建。`);
+          }
+          const session = await backend.ensureSession(conv, projectId, '微信会话');
+          this.recordSeen(key);
+          try { await this.store.save(); }
+          catch (e) { if (key) this.store.data.seen = this.store.data.seen.filter(k => k !== key); throw e; }
+          return this.reply(message, `已新建（${backend.id}/${projectId}）：${session.title}（${sessionId8(session)}）`);
+        }
+        if (!rest) return this.reply(message, `已指定项目 ${projectId} 但任务内容为空，例如：@${backend.id} ${projectId} 列出当前目录`);
+        if (inlineNew) newSession = true;
         message = { ...message, text: rest };
         agentId = backend.id;
       } else {
@@ -98,7 +124,7 @@ export class Bridge {
         projectId = this.currentProjectId(conv);
       }
     }
-    const job = { id: randomUUID(), message, status: 'pending', agent: agentId, project: projectId };
+    const job = { id: randomUUID(), message, status: 'pending', agent: agentId, project: projectId, newSession };
     this.store.data.jobs.push(job);
     this.recordSeen(key);
     try { await this.store.save(); }

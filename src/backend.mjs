@@ -101,7 +101,8 @@ export class AgentBackend {
       if (!project) throw new Error(`任务指向未知项目 ${job.project}（配置已变？请 /cancel 后重发）`);
       const files = await this.prepareFiles(message, project.workspace);
       if (job.cancelled) return this.reply(message, '任务已在准备阶段取消。');
-      let session = this.sessionByRef(conv, job.project, this.currentRef(conv, job.project));
+      // /new 内联标记：不复用 pair 的 current 会话，强制新建（ensureSession 会把新会话设为 current）。
+      let session = job.newSession ? null : this.sessionByRef(conv, job.project, this.currentRef(conv, job.project));
       if (!session) { session = await this.ensureSession(conv, job.project, message.text.slice(0, 32) || '微信附件'); await this.store.save(); }
       await this.reply(message, `已收到，${this.label} → ${job.project} 开始处理。`);
       if (job.cancelled) return this.reply(message, '任务已取消。');

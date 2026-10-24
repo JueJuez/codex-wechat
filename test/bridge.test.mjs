@@ -128,6 +128,39 @@ test('second token that is not a project id stays part of the task', async () =>
   assert.equal(conv.sessions['zcode/wx'][0].id, 'sess_fake-fresh');
 });
 
+test('@引擎 内联 /new 强制新开会话；无任务时降级为 /new 命令', async () => {
+  const { bridge, output, store } = await fixture();
+  const conv = () => store.data.conversations['bot:owner'];
+  // 先建立旧会话
+  await bridge.accept(message('@zcode 旧任务', 'n0'));
+  await until(() => output.filter(s => s.includes('zcode fake done')).length >= 1);
+  // /new 在项目名后：强制新会话，不复用、不 --resume
+  await bridge.accept(message('@zcode wx /new 新会话任务', 'n1'));
+  await until(() => output.filter(s => s.includes('zcode fake done')).length >= 2);
+  const runs = output.filter(s => s.includes('"--cwd"'));
+  assert.ok(!runs[1].includes('--resume'), `内联 /new 不应 resume 旧会话：${runs[1]}`);
+  assert.equal(conv().sessions['zcode/wx'].length, 2);
+  assert.equal(conv().current['zcode/wx'], conv().sessions['zcode/wx'][1].ref);
+  // 后续消息续新会话
+  await bridge.accept(message('@zcode 接着聊', 'n2'));
+  await until(() => output.filter(s => s.includes('zcode fake done')).length >= 3);
+  assert.ok(output.filter(s => s.includes('"--cwd"'))[2].includes('"--resume","sess_fake-fresh"'));
+  // /new 在项目位之前也认（@引擎 /new 项目 任务）
+  await bridge.accept(message('@zcode /new brain 另一项目任务', 'n3'));
+  await until(() => output.filter(s => s.includes('zcode fake done')).length >= 4);
+  const runs2 = output.filter(s => s.includes('"--cwd"'));
+  assert.ok(runs2[3].includes('ws-brain') && !runs2[3].includes('--resume'), `应落 brain 新会话：${runs2[3]}`);
+  // 无任务：@引擎 [项目] /new 降级为 /new 命令，只建会话不跑任务
+  const before = output.filter(s => s.includes('zcode fake done')).length;
+  await bridge.accept(message('@zcode wx /new', 'n4'));
+  await until(() => output.some(s => s.includes('已新建（zcode/wx）')));
+  assert.equal(output.filter(s => s.includes('zcode fake done')).length, before);
+  // 任务正文中位置靠后的 /new 是普通文本，不受影响
+  await bridge.accept(message('@zcode 写个 /new 命令的测试', 'n5'));
+  await until(() => output.filter(s => s.includes('zcode fake done')).length >= before + 1);
+  assert.ok(output.filter(s => s.includes('"-p"')).some(s => s.includes('"-p","写个 /new 命令的测试"')));
+});
+
 test('/project switches the conversation default project for bare messages', async () => {
   const { bridge, codex, output, store, wsBrain } = await fixture({ withZcode: false });
   await bridge.accept(message('/project brain', 'p3'));
