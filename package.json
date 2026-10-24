@@ -1,0 +1,17 @@
+{
+  "name": "codex-wechat", "version": "0.1.0", "private": true, "type": "module",
+  "description": "WeChat to local Codex app-server bridge",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "build": "node node_modules/typescript/bin/tsc -p vendor/wechat-core/tsconfig.build.json && node node_modules/typescript/bin/tsc -p tsconfig.integration.json",
+    "start": "node src/cli.mjs start",
+    "login": "node src/cli.mjs login",
+    "doctor": "node src/cli.mjs doctor",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run build && npm test",
+    "test:core": "node --experimental-transform-types --disable-warning=ExperimentalWarning --test --experimental-test-isolation=none vendor/wechat-core/tests/core.test.ts"
+  },
+  "dependencies": { "qrcode": "^1.5.4" },
+  "devDependencies": { "typescript": "^5.9.3", "@types/node": "^24.12.4" },
+  "license": "MIT"
+}

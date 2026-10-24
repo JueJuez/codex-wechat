@@ -1,0 +1,7 @@
+{
+  "compilerOptions": {
+    "allowJs": true, "checkJs": true, "noEmit": true, "strict": true,
+    "module": "NodeNext", "moduleResolution": "NodeNext", "target": "ES2024", "skipLibCheck": true
+  },
+  "include": ["src/wechat-file.mjs"]
+}

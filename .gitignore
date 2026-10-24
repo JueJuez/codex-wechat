@@ -1,0 +1,6 @@
+node_modules/
+vendor/wechat-core/lib/
+.codex-wechat/
+config.json
+*.log
+outputs/
